@@ -1,0 +1,351 @@
+sudo bash <<'EOF'
+set -e
+
+export DEBIAN_FRONTEND=noninteractive
+
+if ! command -v apt-get >/dev/null 2>&1; then
+    echo "Only Debian/Ubuntu is supported."
+    exit 1
+fi
+
+apt-get update
+apt-get install -y nftables iproute2 kmod procps util-linux
+
+NFT_BIN=""
+for x in /usr/sbin/nft /usr/bin/nft /sbin/nft /bin/nft; do
+    if [ -x "$x" ]; then
+        NFT_BIN="$x"
+        break
+    fi
+done
+
+if [ -z "$NFT_BIN" ]; then
+    echo "nft not found."
+    exit 1
+fi
+
+mkdir -p /etc/nftctl
+touch /etc/nftctl/db
+chmod 700 /etc/nftctl
+chmod 600 /etc/nftctl/db
+
+cat >/etc/sysctl.d/99-nftctl.conf <<'SYSCTL'
+net.ipv4.ip_forward = 1
+SYSCTL
+
+modprobe tcp_bbr 2>/dev/null || true
+modprobe sch_fq 2>/dev/null || true
+
+if sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
+    cat >>/etc/sysctl.d/99-nftctl.conf <<'SYSCTL'
+net.ipv4.tcp_congestion_control = bbr
+SYSCTL
+fi
+
+if sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1; then
+    cat >>/etc/sysctl.d/99-nftctl.conf <<'SYSCTL'
+net.core.default_qdisc = fq
+SYSCTL
+fi
+
+cat >/etc/modules-load.d/nftctl.conf <<'MODULES'
+tcp_bbr
+sch_fq
+MODULES
+
+sysctl --system >/dev/null 2>&1 || true
+
+
+cat >/usr/local/sbin/nftctl-core <<'SCRIPT'
+#!/bin/bash
+set -e
+
+DB="/etc/nftctl/db"
+TABLE="nftctl"
+
+NFT=""
+for x in /usr/sbin/nft /usr/bin/nft /sbin/nft /bin/nft; do
+    if [ -x "$x" ]; then
+        NFT="$x"
+        break
+    fi
+done
+
+if [ -z "$NFT" ]; then
+    echo "nft not found."
+    exit 1
+fi
+
+mkdir -p /etc/nftctl
+touch "$DB"
+chmod 600 "$DB"
+
+exec 9>/run/nftctl.lock
+flock -x 9
+
+valid_ip() {
+    local ip="$1"
+
+    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+
+    local a b c d n
+    IFS='.' read -r a b c d <<< "$ip"
+
+    for n in "$a" "$b" "$c" "$d"; do
+        [[ "$n" =~ ^[0-9]+$ ]] || return 1
+        ((10#$n >= 0 && 10#$n <= 255)) || return 1
+    done
+
+    [ "$ip" != "0.0.0.0" ]
+}
+
+valid_port() {
+    [[ "$1" =~ ^[0-9]+$ ]] || return 1
+    ((10#$1 >= 1 && 10#$1 <= 65535))
+}
+
+reload_rules() {
+    local tmp
+    tmp="$(mktemp)"
+
+    cat >"$tmp" <<'NFT'
+table ip nftctl {
+    chain prerouting {
+        type nat hook prerouting priority dstnat; policy accept;
+NFT
+
+    while read -r PORT IP; do
+        [ -n "$PORT" ] || continue
+        [ -n "$IP" ] || continue
+
+        printf '        tcp dport %s counter dnat to %s:%s\n' \
+            "$PORT" "$IP" "$PORT" >>"$tmp"
+
+        printf '        udp dport %s counter dnat to %s:%s\n' \
+            "$PORT" "$IP" "$PORT" >>"$tmp"
+
+    done <"$DB"
+
+    cat >>"$tmp" <<'NFT'
+    }
+
+    chain postrouting {
+        type nat hook postrouting priority srcnat; policy accept;
+        ct status dnat counter masquerade
+    }
+}
+NFT
+
+    "$NFT" delete table ip "$TABLE" >/dev/null 2>&1 || true
+
+    if ! "$NFT" -f "$tmp"; then
+        echo "ERROR"
+        rm -f "$tmp"
+        exit 1
+    fi
+
+    install -m 600 "$tmp" /etc/nftctl/rules.nft
+    rm -f "$tmp"
+}
+
+add_rule() {
+    local IP PORT tmp
+
+    echo
+    read -rp "IP: " IP
+
+    if ! valid_ip "$IP"; then
+        echo "Invalid IP."
+        exit 1
+    fi
+
+    read -rp "Port: " PORT
+
+    if ! valid_port "$PORT"; then
+        echo "Invalid port."
+        exit 1
+    fi
+
+    tmp="$(mktemp)"
+
+    awk -v p="$PORT" '$1 != p {print}' "$DB" >"$tmp"
+
+    printf '%s %s\n' "$PORT" "$IP" >>"$tmp"
+
+    sort -n -k1,1 "$tmp" >"${tmp}.sorted"
+
+    install -m 600 "${tmp}.sorted" "$DB"
+
+    rm -f "$tmp" "${tmp}.sorted"
+
+    reload_rules
+
+    echo
+    echo "OK"
+    echo "$PORT -> $IP:$PORT"
+    echo "TCP + UDP"
+    echo
+}
+
+list_rules() {
+    echo
+
+    if [ ! -s "$DB" ]; then
+        echo "Empty."
+        echo
+        exit 0
+    fi
+
+    printf "%-10s %-18s %-10s\n" "PORT" "IP" "PROTO"
+    printf "%-10s %-18s %-10s\n" "-----" "---------------" "-------"
+
+    while read -r PORT IP; do
+        [ -n "$PORT" ] || continue
+        printf "%-10s %-18s %-10s\n" "$PORT" "$IP" "TCP+UDP"
+    done <"$DB"
+
+    echo
+}
+
+delete_rule() {
+    local PORT="${1:-}"
+    local tmp
+
+    if [ -z "$PORT" ]; then
+        read -rp "Port: " PORT
+    fi
+
+    if ! valid_port "$PORT"; then
+        echo "Invalid port."
+        exit 1
+    fi
+
+    if ! awk -v p="$PORT" '$1 == p {x=1} END {exit !x}' "$DB"; then
+        echo "Not found."
+        exit 1
+    fi
+
+    tmp="$(mktemp)"
+
+    awk -v p="$PORT" '$1 != p {print}' "$DB" >"$tmp"
+
+    install -m 600 "$tmp" "$DB"
+
+    rm -f "$tmp"
+
+    reload_rules
+
+    echo
+    echo "OK"
+    echo "Removed: $PORT"
+    echo
+}
+
+case "${1:-add}" in
+    add)
+        add_rule
+        ;;
+    list)
+        list_rules
+        ;;
+    del)
+        delete_rule "${2:-}"
+        ;;
+    reload)
+        reload_rules
+        ;;
+    *)
+        echo "nft"
+        echo "nftctl list"
+        echo "nftctl del PORT"
+        echo "nftctl reload"
+        exit 1
+        ;;
+esac
+SCRIPT
+
+chmod 755 /usr/local/sbin/nftctl-core
+
+
+cat >/usr/local/bin/nftctl <<'SCRIPT'
+#!/bin/bash
+
+if [ "$(id -u)" -eq 0 ]; then
+    exec /usr/local/sbin/nftctl-core "$@"
+else
+    exec sudo /usr/local/sbin/nftctl-core "$@"
+fi
+SCRIPT
+
+chmod 755 /usr/local/bin/nftctl
+
+
+cat >/usr/local/bin/nft <<'SCRIPT'
+#!/bin/bash
+
+REAL=""
+
+for x in /usr/sbin/nft /usr/bin/nft /sbin/nft /bin/nft; do
+    if [ -x "$x" ]; then
+        REAL="$x"
+        break
+    fi
+done
+
+if [ "$#" -eq 0 ]; then
+    if [ "$(id -u)" -eq 0 ]; then
+        exec /usr/local/sbin/nftctl-core add
+    else
+        exec sudo /usr/local/sbin/nftctl-core add
+    fi
+fi
+
+exec "$REAL" "$@"
+SCRIPT
+
+chmod 755 /usr/local/bin/nft
+
+
+cat >/etc/systemd/system/nftctl.service <<'SERVICE'
+[Unit]
+Description=nftctl
+After=network-online.target nftables.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/nftctl-core reload
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+
+systemctl daemon-reload
+systemctl enable nftctl.service >/dev/null 2>&1
+
+/usr/local/sbin/nftctl-core reload
+
+echo
+echo "========================================"
+echo "OK"
+echo "========================================"
+echo
+echo "Add:"
+echo "  nft"
+echo
+echo "List:"
+echo "  nftctl list"
+echo
+echo "Delete:"
+echo "  nftctl del 443"
+echo
+echo "Reload:"
+echo "  nftctl reload"
+echo
+echo "Status:"
+sysctl net.ipv4.ip_forward 2>/dev/null || true
+sysctl net.ipv4.tcp_congestion_control 2>/dev/null || true
+sysctl net.core.default_qdisc 2>/dev/null || true
+echo
+EOF
