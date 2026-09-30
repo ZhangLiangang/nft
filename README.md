@@ -1,452 +1,721 @@
-==============================
-nftctl 使用说明
-==============================
+# nftctl 使用说明
+
+## 一、功能
+
+nftctl 用于管理 IPv4 TCP/UDP 端口转发规则。
+
+支持：
+
+- TCP + UDP 同时配置
+- 相同端口转发
+- 不同目标端口转发
+- nftables map
+- IPv4 forwarding
+- conntrack
+- Flowtable Fast Path
+- 自动 Flowtable 兼容性检查
+- BBR
+- fq
+- irqbalance
+- 自动加载
+- 状态检查
+- 自检
+- 网络诊断
 
 
-一、新服务器安装
-------------------------------
+规则格式：
 
-SSH 登录服务器后，把完整安装脚本整段粘贴执行。
+```text
+本机监听端口 -> 目标IP:目标端口
+```
+
+
+例如：
+
+```text
+443 -> 1.2.3.4:443
+```
+
+或者：
+
+```text
+10086 -> 1.2.3.4:443
+```
+
+
+---
+
+# 二、安装
+
+SSH 登录服务器。
 
 如果当前用户不是 root：
 
+```bash
 sudo bash <<'EOF'
-...安装脚本内容...
+...完整安装脚本...
 EOF
+```
 
+如果已经是 root：
 
-如果当前用户就是 root：
-
+```bash
 bash <<'EOF'
-...安装脚本内容...
+...完整安装脚本...
 EOF
+```
 
 
-安装完成后建议执行：
+安装完成后会自动：
 
+- 安装依赖
+- 开启 IPv4 forwarding
+- 检测 BBR
+- 配置 fq
+- 调整 conntrack
+- 启动 irqbalance
+- 自动判断 Flowtable
+- 加载现有规则
+- 创建 nftctl.service
+
+
+---
+
+# 三、安装完成后检查
+
+执行：
+
+```bash
 nftctl status
+```
 
-nftctl selftest
+正常可能显示：
 
-确认配置正常。
+```text
+nftctl
+
+Rules:           2
+Flow mode:       auto
+Auto check:      clear
+Fast path:       on
+IPv4 forward:    1
+Conntrack:       50 / 262144
+Qdisc:           fq
+TCP CC:          bbr
+Interfaces:      eth0
+```
 
 
-二、添加规则
-------------------------------
+重点关注：
+
+```text
+Auto check: clear
+Fast path: on
+IPv4 forward: 1
+```
+
+
+---
+
+# 四、添加规则
 
 交互式添加：
 
+```bash
 nftctl add
+```
 
+然后输入：
 
-然后按提示输入：
-
-Target IP: 目标服务器 IP
-Listen port: 本机监听端口
-Target port [监听端口]: 目标服务器端口
+```text
+Target IP:
+Listen port:
+Target port [Listen port]:
+```
 
 
 例如：
 
-nftctl add
-
+```text
 Target IP: 154.12.34.56
 Listen port: 443
 Target port [443]:
+```
 
+目标端口直接回车，表示使用相同端口。
 
-如果目标端口和监听端口相同，Target port 这里直接按回车即可。
+最终：
 
-成功后显示类似：
-
-Reloaded. Fast path: on
-
+```text
 443 -> 154.12.34.56:443
 TCP + UDP
+```
 
+
+---
+
+# 五、相同端口快速添加
+
+例如：
+
+```text
+443 -> 154.12.34.56:443
+```
+
+直接：
+
+```bash
+nftctl add 154.12.34.56 443
+```
+
+
+等价于：
+
+```text
+Listen port: 443
+Target port: 443
+```
+
+
+---
+
+# 六、不同端口快速添加
+
+例如：
+
+```text
+10086 -> 154.12.34.56:443
+```
+
+执行：
+
+```bash
+nftctl add 154.12.34.56 10086 443
+```
+
+
+参数顺序：
+
+```text
+nftctl add 目标IP 本机监听端口 目标端口
+```
+
+
+例如：
+
+```bash
+nftctl add 8.8.8.8 20000 53
+```
 
 表示：
 
-本机 TCP 443 -> 154.12.34.56:443
-本机 UDP 443 -> 154.12.34.56:443
+```text
+TCP 20000 -> 8.8.8.8:53
+UDP 20000 -> 8.8.8.8:53
+```
 
 
-三、配置不同的目标端口
-------------------------------
+---
 
-新版支持：
+# 七、查看规则
 
-本机端口 -> 目标 IP:不同端口
+执行：
 
-
-例如：
-
-本机 10086 -> 154.12.34.56:443
-
-
-输入：
-
-nftctl add
-
-
-然后：
-
-Target IP: 154.12.34.56
-Listen port: 10086
-Target port [10086]: 443
-
-
-成功后：
-
-10086 -> 154.12.34.56:443
-TCP + UDP
-
-
-实际表示：
-
-本机 TCP 10086 -> 154.12.34.56:443
-本机 UDP 10086 -> 154.12.34.56:443
-
-
-四、命令行直接添加
-------------------------------
-
-除了交互模式，也可以直接使用命令添加。
-
-
-1. 相同端口
+```bash
+nftctl list
+```
 
 例如：
 
-443 -> 154.12.34.56:443
+```text
+LISTEN       TARGET IP          TARGET PORT  PROTO
+------       ---------------    -----------  -------
+443          1.2.3.4            443          TCP+UDP
+8443         2.3.4.5            443          TCP+UDP
+10086        3.4.5.6            8443         TCP+UDP
+```
 
-输入：
 
-nftctl add 154.12.34.56 443
+---
+
+# 八、修改已有规则
+
+规则以本机监听端口作为唯一键。
+
+例如原来：
+
+```text
+443 -> 1.1.1.1:443
+```
+
+现在执行：
+
+```bash
+nftctl add 2.2.2.2 443
+```
+
+最终变成：
+
+```text
+443 -> 2.2.2.2:443
+```
 
 
-等同于：
+不需要先删除。
 
-Target IP: 154.12.34.56
+
+也可以修改目标端口：
+
+```bash
+nftctl add 2.2.2.2 443 8443
+```
+
+最终：
+
+```text
+443 -> 2.2.2.2:8443
+```
+
+
+---
+
+# 九、删除规则
+
+例如删除本机监听端口 443：
+
+```bash
+nftctl del 443
+```
+
+也可以：
+
+```bash
+nftctl del
+```
+
+然后输入：
+
+```text
 Listen port: 443
-Target port: 443
+```
 
 
-2. 不同端口
+例如规则是：
+
+```text
+10086 -> 1.2.3.4:443
+```
+
+删除时使用：
+
+```bash
+nftctl del 10086
+```
+
+不是：
+
+```bash
+nftctl del 443
+```
+
+
+---
+
+# 十、重新加载
+
+执行：
+
+```bash
+nftctl reload
+```
+
+正常可能显示：
+
+```text
+Reloaded. Fast path: on
+```
+
+
+如果自动兼容性检查认为当前系统不适合使用 Flowtable，则可能显示：
+
+```text
+Reloaded. Fast path: off
+```
+
+
+普通转发仍然正常工作。
+
+
+---
+
+# 十一、Flowtable 自动模式
+
+默认配置文件：
+
+```text
+/etc/nftctl/config
+```
+
+默认：
+
+```text
+FLOWTABLE=auto
+IFACES=""
+```
+
+
+推荐保持：
+
+```text
+FLOWTABLE=auto
+```
+
+
+自动模式会检查服务器现有的 nftables 配置。
+
+
+以下情况不会被认为是冲突：
+
+```text
+普通 NAT prerouting
+普通 NAT postrouting
+空的 FORWARD 链
+policy accept
+```
+
 
 例如：
 
-10086 -> 154.12.34.56:443
+```text
+chain forward {
+    type filter hook forward priority filter;
+    policy accept;
+}
+```
 
-输入：
-
-nftctl add 154.12.34.56 10086 443
-
-
-参数顺序为：
-
-nftctl add 目标IP 本机监听端口 目标端口
+如果链里没有实际规则，则允许 Fast Path。
 
 
-五、继续添加其他端口
-------------------------------
+普通：
 
-再次执行：
+```text
+type nat
+```
 
-nftctl add
+规则也允许存在。
 
+
+---
+
+# 十二、什么情况下自动关闭 Fast Path
+
+如果 forwarding 数据路径中存在其他非 NAT 实际规则，例如：
+
+```text
+ingress
+prerouting
+forward
+postrouting
+```
+
+中的 filter、mangle 等规则，自动模式会保守地关闭 Fast Path。
+
+
+如果相关 base chain 使用：
+
+```text
+policy drop
+```
+
+或其他非 ACCEPT policy，也会关闭。
+
+
+这样可以避免 Fast Path 绕过服务器已有的数据包处理逻辑。
+
+
+---
+
+# 十三、检查 Flowtable 自动判断
+
+执行：
+
+```bash
+nftctl flowcheck
+```
+
+正常情况下：
+
+```text
+Flowtable mode: auto
+
+No conflicting forwarding-path rules detected.
+```
+
+
+这意味着自动模式允许启用 Flowtable。
+
+
+如果存在冲突，则会列出对应：
+
+```text
+family
+table
+chain
+type
+hook
+policy
+rules
+```
+
+
+---
+
+# 十四、查看 Fast Path 状态
+
+执行：
+
+```bash
+nftctl status
+```
 
 例如：
 
-Target IP: 154.12.34.56
-Listen port: 8443
-Target port [8443]:
+```text
+Flow mode:       auto
+Auto check:      clear
+Fast path:       on
+```
 
 
-即可增加：
+含义：
 
-8443 -> 154.12.34.56:8443
+```text
+Flow mode: auto
+```
+
+使用自动判断。
+
+
+```text
+Auto check: clear
+```
+
+没有发现需要阻止 Fast Path 的规则。
+
+
+```text
+Fast path: on
+```
+
+Flowtable 已经创建并加载。
+
+
+---
+
+# 十五、检查实际进入 Fast Path 的连接
+
+产生实际转发流量之后执行：
+
+```bash
+nftctl offload
+```
+
+如果存在 software flowtable 连接，会显示带：
+
+```text
+[OFFLOAD]
+```
+
+的 conntrack 项。
 
 
 也可以直接：
 
-nftctl add 154.12.34.56 8443
+```bash
+conntrack -L 2>/dev/null | grep '\[OFFLOAD\]'
+```
 
 
-如果目标端口不同，例如：
+如果当前没有符合条件的活动连接，可能显示：
 
-8443 -> 154.12.34.56:443
+```text
+None currently visible.
+```
 
-可以直接：
+这本身不代表配置错误。
 
-nftctl add 154.12.34.56 8443 443
 
+---
 
-六、修改已有端口
-------------------------------
+# 十六、查看实际 nftctl 规则
 
-不需要先删除。
+执行：
 
-规则以“本机监听端口”为唯一键。
-
-假设原来：
-
-443 -> 154.12.34.56:443
-
-
-现在需要改成：
-
-443 -> 89.20.30.40:443
-
-
-直接输入：
-
-nftctl add 89.20.30.40 443
-
-
-脚本会自动替换原来的 443 规则。
-
-
-如果需要同时修改目标端口，例如：
-
-443 -> 89.20.30.40:8443
-
-
-直接输入：
-
-nftctl add 89.20.30.40 443 8443
-
-
-最终规则变成：
-
-443 -> 89.20.30.40:8443
-
-
-七、查看所有规则
-------------------------------
-
-输入：
-
-nftctl list
-
-
-例如显示：
-
-LISTEN       TARGET IP          TARGET PORT  PROTO
-------       ---------------    -----------  -------
-443          89.20.30.40        443          TCP+UDP
-8443         154.12.34.56       443          TCP+UDP
-10000        20.30.40.50        10000        TCP+UDP
-
-
-各字段含义：
-
-LISTEN
-本机监听端口
-
-TARGET IP
-目标服务器 IP
-
-TARGET PORT
-目标服务器端口
-
-PROTO
-协议，目前同时配置 TCP 和 UDP
-
-
-八、删除规则
-------------------------------
-
-规则按照本机监听端口删除。
-
-
-例如删除本机 443：
-
-nftctl del 443
-
-
-成功后显示类似：
-
-Reloaded. Fast path: on
-
-Removed: 443
-
-
-也可以输入：
-
-nftctl del
-
-
-然后按提示输入：
-
-Listen port: 443
-
-
-注意：
-
-如果规则是：
-
-10086 -> 1.2.3.4:443
-
-
-需要删除的是：
-
-nftctl del 10086
-
-
-而不是：
-
-nftctl del 443
-
-
-九、重新加载规则
-------------------------------
-
-输入：
-
-nftctl reload
-
-
-正常显示类似：
-
-Reloaded. Fast path: on
-
-
-如果当前系统环境不适合启用 flowtable，也可能显示：
-
-Reloaded. Fast path: off
-
-
-规则仍然可以正常工作。
-
-
-十、查看 nft 实际规则
-------------------------------
-
-查看 nftctl 创建的规则：
-
+```bash
 nft list table ip nftctl
+```
+
+Fast Path 开启时应该包含类似：
+
+```text
+flowtable fastpath {
+    hook ingress priority filter
+    devices = { eth0 }
+}
+```
 
 
-查看系统全部 nftables 规则：
+并包含：
 
+```text
+chain forward {
+    type filter hook forward priority filter;
+    policy accept;
+
+    ct mark 0x40000000 ip protocol { tcp, udp } flow add @fastpath
+}
+```
+
+
+---
+
+# 十七、查看全部 nftables
+
+执行：
+
+```bash
 nft list ruleset
+```
 
 
-注意：
+系统原生：
 
-新版不再修改或替代系统原生 nft 命令。
+```text
+nft
+```
+
+命令没有被 nftctl 替代。
 
 
 因此：
 
-nft
+```bash
+nft list ruleset
+```
 
-就是系统原生 nftables 命令。
-
-
-添加转发规则必须使用：
-
-nftctl add
+仍然是正常系统命令。
 
 
-不要再使用旧版的：
+管理 nftctl 使用：
 
-nft
-
-进入添加界面。
-
-
-十一、服务器重启
-------------------------------
-
-服务器重启后不需要重新添加规则。
-
-规则数据库保存在：
-
-/etc/nftctl/db
+```bash
+nftctl ...
+```
 
 
-配置文件：
+---
 
-/etc/nftctl/config
+# 十八、状态检查
 
+执行：
 
-生成的 nftables 规则：
-
-/etc/nftctl/rules.nft
-
-
-开机自动加载服务：
-
-nftctl.service
-
-
-查看服务状态：
-
-systemctl status nftctl
-
-
-手动重新加载：
-
-nftctl reload
-
-
-十二、查看运行状态
-------------------------------
-
-输入：
-
+```bash
 nftctl status
-
+```
 
 例如：
 
-nftctl
-
-Rules:           3
+```text
+Rules:           2
+Flow mode:       auto
+Auto check:      clear
 Fast path:       on
 IPv4 forward:    1
-Conntrack:       152 / 1048576
+Conntrack:       46 / 262144
 Qdisc:           fq
 TCP CC:          bbr
 Interfaces:      eth0
+```
 
 
-主要项目说明：
+各项含义：
 
+```text
 Rules
-当前规则数量
+```
 
+当前转发规则数量。
+
+
+```text
+Flow mode
+```
+
+Flowtable 配置模式。
+
+
+```text
+Auto check
+```
+
+自动兼容性检查结果。
+
+
+```text
 Fast path
-flowtable fast path 是否启用
+```
 
+当前是否创建 Flowtable。
+
+
+```text
 IPv4 forward
-IPv4 转发是否启用
+```
 
+IPv4 forwarding 是否开启。
+
+
+```text
 Conntrack
-当前连接跟踪数量 / 最大容量
+```
 
+当前连接跟踪数量和最大容量。
+
+
+```text
 Qdisc
-默认队列调度器
+```
 
+系统默认 qdisc。
+
+
+```text
 TCP CC
-本机 TCP 拥塞控制算法
+```
 
+服务器本机 TCP congestion control。
+
+
+```text
 Interfaces
-当前检测到的网络接口
+```
+
+Flowtable 使用的网络接口。
 
 
-十三、运行自检
-------------------------------
+---
 
-输入：
+# 十九、自检
 
+执行：
+
+```bash
 nftctl selftest
+```
 
+正常情况下：
 
-正常情况下类似：
-
+```text
 Database:
   OK
 
@@ -463,652 +732,577 @@ Routes:
 Saved ruleset:
   OK
 
-Result: OK
-
-
-如果最后显示：
+Flowtable:
+  ON
 
 Result: OK
+```
 
-说明主要配置正常。
 
+重点：
 
-十四、查看详细网络诊断
-------------------------------
+```text
+Result: OK
+```
 
-输入：
 
-nftctl diag
+---
 
-
-会显示包括：
-
-系统信息
-
-CPU 数量
-
-内存容量
-
-IPv4 路由
-
-网络接口
-
-网卡队列
-
-GRO
-
-GSO
-
-TSO
-
-Checksum Offload
-
-Qdisc
-
-Conntrack
-
-Socket 统计
-
-nftctl 实际规则
-
-
-如果需要排查性能或网络问题，可以保存：
-
-nftctl diag
-
-的完整输出。
-
-
-十五、检查 IPv4 Forwarding
-------------------------------
-
-输入：
-
-sysctl net.ipv4.ip_forward
-
-
-正常应该显示：
-
-net.ipv4.ip_forward = 1
-
-
-也可以直接：
-
-nftctl status
-
-
-查看：
-
-IPv4 forward: 1
-
-
-十六、检查 BBR
-------------------------------
-
-输入：
-
-sysctl net.ipv4.tcp_congestion_control
-
-
-如果系统支持并已经启用 BBR，通常显示：
-
-net.ipv4.tcp_congestion_control = bbr
-
-
-也可以：
-
-nftctl status
-
-
-查看：
-
-TCP CC: bbr
-
-
-注意：
-
-BBR 主要作用于服务器本机 TCP 连接。
-
-流量转发本身主要依赖 nftables、conntrack、网卡处理和 flowtable 等机制。
-
-
-十七、检查 fq
-------------------------------
-
-输入：
-
-sysctl net.core.default_qdisc
-
-
-正常情况下可能显示：
-
-net.core.default_qdisc = fq
-
-
-也可以：
-
-nftctl status
-
-
-查看：
-
-Qdisc: fq
-
-
-十八、检查 Fast Path
-------------------------------
-
-输入：
-
-nftctl status
-
-
-查看：
-
-Fast path: on
-
-
-如果显示：
-
-Fast path: on
-
-说明 nftables flowtable fast path 已启用。
-
-
-如果显示：
-
-Fast path: off
-
-规则仍然正常工作，只是当前没有启用 flowtable fast path。
-
-
-默认配置：
-
-/etc/nftctl/config
-
-
-内容通常为：
-
-FLOWTABLE=auto
-IFACES=""
-
-
-auto 表示自动判断是否启用。
-
-
-十九、最常用命令
-------------------------------
-
-交互添加：
-
-nftctl add
-
-
-快速添加相同端口：
-
-nftctl add 1.2.3.4 443
-
-
-快速添加不同端口：
-
-nftctl add 1.2.3.4 10086 443
-
-
-查看：
-
-nftctl list
-
-
-删除：
-
-nftctl del 443
-
-
-重新加载：
-
-nftctl reload
-
-
-查看状态：
-
-nftctl status
-
-
-自检：
-
-nftctl selftest
-
-
-详细诊断：
-
-nftctl diag
-
-
-二十、常用示例
-------------------------------
-
-示例 1：
-
-本机 443 -> 1.2.3.4:443
-
-输入：
-
-nftctl add 1.2.3.4 443
-
-
-结果：
-
-443 -> 1.2.3.4:443
-
-
---------------------------------------------------
-
-
-示例 2：
-
-本机 8443 -> 1.2.3.4:8443
-
-输入：
-
-nftctl add 1.2.3.4 8443
-
-
-结果：
-
-8443 -> 1.2.3.4:8443
-
-
---------------------------------------------------
-
-
-示例 3：
-
-本机 10086 -> 1.2.3.4:443
-
-输入：
-
-nftctl add 1.2.3.4 10086 443
-
-
-结果：
-
-10086 -> 1.2.3.4:443
-
-
---------------------------------------------------
-
-
-示例 4：
-
-本机 20000 -> 8.8.8.8:53
-
-输入：
-
-nftctl add 8.8.8.8 20000 53
-
-
-结果：
-
-20000 -> 8.8.8.8:53
-
-
-实际同时包含：
-
-TCP 20000 -> 8.8.8.8:53
-UDP 20000 -> 8.8.8.8:53
-
-
---------------------------------------------------
-
-
-查看全部规则：
-
-nftctl list
-
-
-删除本机 10086：
-
-nftctl del 10086
-
-
-重新加载：
-
-nftctl reload
-
-
-查看实际 nftables 规则：
-
-nft list table ip nftctl
-
-
-二十一、注意事项
-------------------------------
-
-1. 新版支持相同端口和不同端口。
-
-相同端口：
-
-443 -> 1.2.3.4:443
-
-
-不同端口：
-
-10086 -> 1.2.3.4:443
-
-
-都可以直接配置。
-
-
---------------------------------------------------
-
-
-2. 添加规则时参数顺序必须注意。
-
-相同端口：
-
-nftctl add 目标IP 本机监听端口
-
-
-例如：
-
-nftctl add 1.2.3.4 443
-
-
-不同端口：
-
-nftctl add 目标IP 本机监听端口 目标端口
-
-
-例如：
-
-nftctl add 1.2.3.4 10086 443
-
-
---------------------------------------------------
-
-
-3. 交互模式下目标端口可以直接回车。
-
-例如：
-
-Target IP: 1.2.3.4
-Listen port: 443
-Target port [443]:
-
-
-如果直接按回车：
-
-目标端口自动使用 443。
-
-
-最终：
-
-443 -> 1.2.3.4:443
-
-
---------------------------------------------------
-
-
-4. TCP 和 UDP 会同时配置。
-
-例如：
-
-10086 -> 1.2.3.4:443
-
-
-实际包含：
-
-TCP 10086 -> 1.2.3.4:443
-UDP 10086 -> 1.2.3.4:443
-
-
---------------------------------------------------
-
-
-5. 相同监听端口再次添加会覆盖原规则。
-
-例如原来：
-
-443 -> 1.1.1.1:443
-
-
-重新执行：
-
-nftctl add 2.2.2.2 443
-
-
-最终变成：
-
-443 -> 2.2.2.2:443
-
-
-原来的：
-
-443 -> 1.1.1.1:443
-
-会被替换。
-
-
---------------------------------------------------
-
-
-6. 也可以修改目标端口。
-
-例如原来：
-
-443 -> 1.1.1.1:443
-
+# 二十、完整诊断
 
 执行：
 
-nftctl add 1.1.1.1 443 8443
+```bash
+nftctl diag
+```
+
+输出包括：
+
+```text
+系统版本
+CPU 数量
+RAM
+
+IPv4 route
+
+网络接口
+
+网卡 RX/TX queue
+
+GRO
+GSO
+TSO
+checksum offload
+hw-tc-offload
+
+qdisc
+
+Flowtable compatibility check
+
+OFFLOAD 连接
+
+conntrack
+
+socket statistics
+
+完整 nftctl ruleset
+```
 
 
-最终：
+排查网络或性能问题时，保存：
 
-443 -> 1.1.1.1:8443
+```bash
+nftctl diag
+```
+
+完整输出即可。
 
 
---------------------------------------------------
+---
+
+# 二十一、检查 IPv4 Forwarding
+
+执行：
+
+```bash
+sysctl net.ipv4.ip_forward
+```
+
+正常：
+
+```text
+net.ipv4.ip_forward = 1
+```
 
 
-7. 删除规则按照本机监听端口删除。
+也可以：
+
+```bash
+nftctl status
+```
+
+
+---
+
+# 二十二、检查 BBR
+
+执行：
+
+```bash
+sysctl net.ipv4.tcp_congestion_control
+```
+
+支持并启用时：
+
+```text
+net.ipv4.tcp_congestion_control = bbr
+```
+
+
+也可以：
+
+```bash
+nftctl status
+```
+
+查看：
+
+```text
+TCP CC: bbr
+```
+
+
+BBR主要作用于服务器本机 TCP socket。
+
+转发数据路径主要由 nftables、conntrack、routing、Flowtable 和网络接口处理。
+
+
+---
+
+# 二十三、检查 fq
+
+执行：
+
+```bash
+sysctl net.core.default_qdisc
+```
+
+通常：
+
+```text
+net.core.default_qdisc = fq
+```
+
+
+---
+
+# 二十四、Conntrack
+
+执行：
+
+```bash
+nftctl status
+```
 
 例如：
 
-10086 -> 1.2.3.4:443
+```text
+Conntrack: 46 / 262144
+```
 
 
-删除：
+表示：
 
-nftctl del 10086
-
-
---------------------------------------------------
-
-
-8. 云服务器安全组必须允许本机监听端口。
-
-例如：
-
-10086 -> 1.2.3.4:443
+```text
+当前连接跟踪数量：46
+最大数量：262144
+```
 
 
-云平台安全组需要允许的是：
-
-TCP 10086
-UDP 10086
+脚本会根据服务器 RAM 自动选择容量，并且不会主动降低系统已有的更大配置。
 
 
-不是目标端口 443。
+---
+
+# 二十五、服务器重启
+
+不需要重新添加规则。
 
 
-服务器内部 nftables 无法修改云平台外层安全组。
+规则数据库：
 
-
---------------------------------------------------
-
-
-9. 系统原生 nft 命令没有被修改。
-
-因此：
-
-nft list ruleset
-
-nft list table ip nftctl
-
-等命令都可以正常使用。
-
-
-管理 nftctl 必须使用：
-
-nftctl ...
-
-
-例如：
-
-nftctl add
-nftctl list
-nftctl del
-nftctl reload
-
-
---------------------------------------------------
-
-
-10. 规则数据库格式。
-
-规则保存在：
-
+```text
 /etc/nftctl/db
+```
 
 
-新版每条规则格式：
+配置：
 
-本机监听端口 目标IP 目标端口
-
-
-例如：
-
-443 1.2.3.4 443
-10086 1.2.3.4 443
-20000 8.8.8.8 53
+```text
+/etc/nftctl/config
+```
 
 
-旧版两列规则：
+生成的 nftables 文件：
 
-443 1.2.3.4
-
-安装新版时会自动转换成：
-
-443 1.2.3.4 443
+```text
+/etc/nftctl/rules.nft
+```
 
 
-==============================
-命令速查
-==============================
+服务：
 
-交互添加：
-
-nftctl add
-
-
-相同端口：
-
-nftctl add 1.2.3.4 443
-
-
-不同端口：
-
-nftctl add 1.2.3.4 10086 443
+```text
+nftctl.service
+```
 
 
 查看：
 
+```bash
+systemctl status nftctl
+```
+
+
+手动重新加载：
+
+```bash
+nftctl reload
+```
+
+
+---
+
+# 二十六、数据库格式
+
+数据库：
+
+```text
+/etc/nftctl/db
+```
+
+
+每一行：
+
+```text
+LISTEN_PORT TARGET_IP TARGET_PORT
+```
+
+
+例如：
+
+```text
+443 1.2.3.4 443
+10086 1.2.3.4 8443
+20000 8.8.8.8 53
+```
+
+
+安装程序兼容旧版两列格式。
+
+
+旧：
+
+```text
+443 1.2.3.4
+```
+
+会自动转换成：
+
+```text
+443 1.2.3.4 443
+```
+
+
+---
+
+# 二十七、网络接口
+
+默认：
+
+```text
+IFACES=""
+```
+
+
+表示自动检测。
+
+
+一般不需要修改。
+
+
+如果明确需要指定接口：
+
+```text
+/etc/nftctl/config
+```
+
+
+例如：
+
+```text
+FLOWTABLE=auto
+IFACES="eth0"
+```
+
+
+修改以后：
+
+```bash
+nftctl reload
+```
+
+
+---
+
+# 二十八、Flowtable 手动模式
+
+推荐使用：
+
+```text
+FLOWTABLE=auto
+```
+
+
+也支持手动开启：
+
+```text
+FLOWTABLE=on
+```
+
+
+以及关闭：
+
+```text
+FLOWTABLE=off
+```
+
+
+修改：
+
+```bash
+nano /etc/nftctl/config
+```
+
+
+修改以后：
+
+```bash
+nftctl reload
+```
+
+
+正常情况下不需要手动设置。
+
+
+---
+
+# 二十九、云平台安全组
+
+云平台安全组需要允许的是：
+
+```text
+本机监听端口
+```
+
+
+例如：
+
+```text
+10086 -> 1.2.3.4:443
+```
+
+
+云平台需要允许：
+
+```text
+TCP 10086
+UDP 10086
+```
+
+
+目标端口：
+
+```text
+443
+```
+
+不是本机安全组需要开放的端口。
+
+
+---
+
+# 三十、最常用命令
+
+交互添加：
+
+```bash
+nftctl add
+```
+
+
+相同端口：
+
+```bash
+nftctl add 1.2.3.4 443
+```
+
+
+不同端口：
+
+```bash
+nftctl add 1.2.3.4 10086 443
+```
+
+
+查看：
+
+```bash
 nftctl list
+```
 
 
 删除：
 
+```bash
 nftctl del 443
+```
 
 
 重新加载：
 
+```bash
 nftctl reload
+```
 
 
 状态：
 
+```bash
 nftctl status
+```
+
+
+Flowtable 检查：
+
+```bash
+nftctl flowcheck
+```
+
+
+检查实际 offload：
+
+```bash
+nftctl offload
+```
 
 
 自检：
 
+```bash
 nftctl selftest
+```
 
 
-详细诊断：
+完整诊断：
 
+```bash
 nftctl diag
+```
 
 
-查看实际规则：
+查看实际 nftctl 表：
 
+```bash
 nft list table ip nftctl
+```
 
 
-查看全部 nft：
+查看全部 nftables：
 
+```bash
 nft list ruleset
+```
 
 
 查看服务：
 
+```bash
 systemctl status nftctl
+```
 
 
-查看 IP Forward：
+---
 
-sysctl net.ipv4.ip_forward
+# 三十一、推荐安装后检查流程
+
+安装完成以后依次执行：
+
+```bash
+nftctl status
+
+nftctl flowcheck
+
+nftctl selftest
+
+nft list table ip nftctl
+```
 
 
-查看 BBR：
+正常目标：
 
-sysctl net.ipv4.tcp_congestion_control
+```text
+Flow mode:       auto
+Auto check:      clear
+Fast path:       on
+IPv4 forward:    1
+```
 
 
-查看 fq：
+并且：
 
-sysctl net.core.default_qdisc
+```text
+Result: OK
+```
 
 
-==============================
-最简使用流程
-==============================
+有实际转发流量之后：
 
-添加：
+```bash
+nftctl offload
+```
 
-nftctl add
+
+如果连接已经进入 software fast path，可以看到：
+
+```text
+[OFFLOAD]
+```
+
+
+---
+
+# 三十二、最简使用流程
+
+添加相同端口：
+
+```bash
+nftctl add 1.2.3.4 443
+```
+
+
+添加不同端口：
+
+```bash
+nftctl add 1.2.3.4 10086 443
+```
 
 
 查看：
 
+```bash
 nftctl list
+```
 
 
 删除：
 
-nftctl del 本机监听端口
+```bash
+nftctl del 10086
+```
 
 
-检查：
+状态：
 
+```bash
 nftctl status
+```
 
 
 排错：
 
+```bash
 nftctl selftest
 
 nftctl diag
+```
