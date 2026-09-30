@@ -1,18 +1,48 @@
 sudo bash <<'EOF'
-set -e
+set -euo pipefail
 
 export DEBIAN_FRONTEND=noninteractive
+
+
+# ============================================================
+# System check
+# ============================================================
 
 if ! command -v apt-get >/dev/null 2>&1; then
     echo "Only Debian/Ubuntu is supported."
     exit 1
 fi
 
+
+# ============================================================
+# Packages
+# ============================================================
+
 apt-get update
-apt-get install -y nftables iproute2 kmod procps util-linux
+
+apt-get install -y \
+    nftables \
+    iproute2 \
+    kmod \
+    procps \
+    util-linux \
+    ethtool \
+    conntrack \
+    irqbalance
+
+
+# ============================================================
+# Locate nft
+# ============================================================
 
 NFT_BIN=""
-for x in /usr/sbin/nft /usr/bin/nft /sbin/nft /bin/nft; do
+
+for x in \
+    /usr/sbin/nft \
+    /usr/bin/nft \
+    /sbin/nft \
+    /bin/nft
+do
     if [ -x "$x" ]; then
         NFT_BIN="$x"
         break
@@ -24,291 +54,2276 @@ if [ -z "$NFT_BIN" ]; then
     exit 1
 fi
 
+
+# ============================================================
+# Directory
+# ============================================================
+
 mkdir -p /etc/nftctl
-touch /etc/nftctl/db
+
 chmod 700 /etc/nftctl
+
+
+# ============================================================
+# Database
+# ============================================================
+
+if [ ! -e /etc/nftctl/db ]; then
+    : >/etc/nftctl/db
+fi
+
 chmod 600 /etc/nftctl/db
 
-cat >/etc/sysctl.d/99-nftctl.conf <<'SYSCTL'
+
+# ============================================================
+# Migrate old database
+#
+# Old:
+# LISTEN_PORT TARGET_IP
+#
+# New:
+# LISTEN_PORT TARGET_IP TARGET_PORT
+# ============================================================
+
+if [ -s /etc/nftctl/db ]; then
+
+    DB_MIGRATE="$(mktemp)"
+
+    awk '
+        NF == 2 {
+            print $1, $2, $1
+            next
+        }
+
+        NF == 3 {
+            print $1, $2, $3
+            next
+        }
+
+        NF > 0 {
+            print
+        }
+    ' /etc/nftctl/db >"$DB_MIGRATE"
+
+    install \
+        -m 600 \
+        "$DB_MIGRATE" \
+        /etc/nftctl/db
+
+    rm -f "$DB_MIGRATE"
+
+fi
+
+
+# ============================================================
+# Configuration
+# ============================================================
+
+if [ ! -e /etc/nftctl/config ]; then
+
+    cat >/etc/nftctl/config <<'CONFIG'
+FLOWTABLE=auto
+IFACES=""
+CONFIG
+
+    chmod 600 /etc/nftctl/config
+
+fi
+
+
+# ============================================================
+# Remove old nft wrapper
+# ============================================================
+
+if [ -f /usr/local/bin/nft ] && \
+   grep -q '/usr/local/sbin/nftctl-core' \
+       /usr/local/bin/nft \
+       2>/dev/null
+then
+    rm -f /usr/local/bin/nft
+fi
+
+
+# ============================================================
+# Kernel modules
+# ============================================================
+
+for mod in \
+    nf_conntrack \
+    nf_nat \
+    nft_nat \
+    nft_flow_offload \
+    tcp_bbr \
+    sch_fq
+do
+
+    modprobe "$mod" \
+        2>/dev/null ||
+        true
+
+done
+
+
+# ============================================================
+# Persistent modules
+# ============================================================
+
+: >/etc/modules-load.d/nftctl.conf
+
+for mod in \
+    nf_conntrack \
+    nf_nat \
+    nft_nat \
+    nft_flow_offload \
+    tcp_bbr \
+    sch_fq
+do
+
+    if modprobe -n "$mod" \
+        >/dev/null 2>&1
+    then
+        echo "$mod" \
+            >>/etc/modules-load.d/nftctl.conf
+    fi
+
+done
+
+
+# ============================================================
+# sysctl
+# ============================================================
+
+SYSCTL_FILE="/etc/sysctl.d/99-nftctl.conf"
+
+cat >"$SYSCTL_FILE" <<'SYSCTL'
 net.ipv4.ip_forward = 1
 SYSCTL
 
-modprobe tcp_bbr 2>/dev/null || true
-modprobe sch_fq 2>/dev/null || true
 
-if sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
-    cat >>/etc/sysctl.d/99-nftctl.conf <<'SYSCTL'
-net.ipv4.tcp_congestion_control = bbr
-SYSCTL
+add_sysctl_if_present() {
+
+    local key="$1"
+
+    local value="$2"
+
+    local path="/proc/sys/${key//./\/}"
+
+
+    if [ -e "$path" ]; then
+
+        printf \
+            '%s = %s\n' \
+            "$key" \
+            "$value" \
+            >>"$SYSCTL_FILE"
+
+    fi
+
+}
+
+
+# ============================================================
+# Forwarding datapath
+# ============================================================
+
+add_sysctl_if_present \
+    net.core.netdev_max_backlog \
+    16384
+
+
+add_sysctl_if_present \
+    net.core.netdev_budget \
+    600
+
+
+add_sysctl_if_present \
+    net.core.netdev_budget_usecs \
+    4000
+
+
+# ============================================================
+# Local TCP
+# ============================================================
+
+if sysctl \
+    -n \
+    net.ipv4.tcp_available_congestion_control \
+    2>/dev/null |
+    grep -qw bbr
+then
+
+    add_sysctl_if_present \
+        net.ipv4.tcp_congestion_control \
+        bbr
+
 fi
 
-if sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1; then
-    cat >>/etc/sysctl.d/99-nftctl.conf <<'SYSCTL'
-net.core.default_qdisc = fq
-SYSCTL
+
+if sysctl \
+    -w \
+    net.core.default_qdisc=fq \
+    >/dev/null 2>&1
+then
+
+    add_sysctl_if_present \
+        net.core.default_qdisc \
+        fq
+
 fi
 
-cat >/etc/modules-load.d/nftctl.conf <<'MODULES'
-tcp_bbr
-sch_fq
-MODULES
 
-sysctl --system >/dev/null 2>&1 || true
+# ============================================================
+# Conntrack
+# ============================================================
 
+modprobe nf_conntrack \
+    2>/dev/null ||
+    true
+
+
+if [ -e /proc/sys/net/netfilter/nf_conntrack_max ]; then
+
+    MEM_MB=$(
+        awk '
+        /MemTotal:/ {
+            print int($2 / 1024)
+        }
+        ' /proc/meminfo
+    )
+
+
+    case "$MEM_MB" in
+
+        ''|*[!0-9]*)
+
+            CT_TARGET=262144
+
+            ;;
+
+
+        *)
+
+            if [ "$MEM_MB" -lt 1024 ]; then
+
+                CT_TARGET=131072
+
+            elif [ "$MEM_MB" -lt 2048 ]; then
+
+                CT_TARGET=262144
+
+            elif [ "$MEM_MB" -lt 4096 ]; then
+
+                CT_TARGET=524288
+
+            elif [ "$MEM_MB" -lt 8192 ]; then
+
+                CT_TARGET=1048576
+
+            else
+
+                CT_TARGET=2097152
+
+            fi
+
+            ;;
+
+    esac
+
+
+    CT_CURRENT=$(
+        cat \
+            /proc/sys/net/netfilter/nf_conntrack_max \
+            2>/dev/null ||
+        echo 0
+    )
+
+
+    if ! [[ "$CT_CURRENT" =~ ^[0-9]+$ ]]; then
+        CT_CURRENT=0
+    fi
+
+
+    if [ "$CT_CURRENT" -gt "$CT_TARGET" ]; then
+        CT_TARGET="$CT_CURRENT"
+    fi
+
+
+    add_sysctl_if_present \
+        net.netfilter.nf_conntrack_max \
+        "$CT_TARGET"
+
+fi
+
+
+# ============================================================
+# Apply sysctl
+# ============================================================
+
+sysctl --system \
+    >/dev/null 2>&1 ||
+    true
+
+
+# ============================================================
+# irqbalance
+# ============================================================
+
+CPU_COUNT=$(
+    nproc \
+        2>/dev/null ||
+    echo 1
+)
+
+
+if [ "$CPU_COUNT" -gt 1 ]; then
+
+    systemctl \
+        enable \
+        --now \
+        irqbalance.service \
+        >/dev/null 2>&1 ||
+        true
+
+fi
+
+
+# ============================================================
+# nftctl core
+# ============================================================
 
 cat >/usr/local/sbin/nftctl-core <<'SCRIPT'
 #!/bin/bash
-set -e
+
+set -euo pipefail
+
 
 DB="/etc/nftctl/db"
+
+RULES="/etc/nftctl/rules.nft"
+
+CONFIG="/etc/nftctl/config"
+
 TABLE="nftctl"
 
+MARK="0x40000000"
+
+
+# ============================================================
+# nft binary
+# ============================================================
+
 NFT=""
-for x in /usr/sbin/nft /usr/bin/nft /sbin/nft /bin/nft; do
+
+for x in \
+    /usr/sbin/nft \
+    /usr/bin/nft \
+    /sbin/nft \
+    /bin/nft
+do
+
     if [ -x "$x" ]; then
+
         NFT="$x"
+
         break
+
     fi
+
 done
 
+
 if [ -z "$NFT" ]; then
+
     echo "nft not found."
+
     exit 1
+
 fi
 
+
+# ============================================================
+# Storage
+# ============================================================
+
 mkdir -p /etc/nftctl
-touch "$DB"
+
+chmod 700 /etc/nftctl
+
+
+if [ ! -e "$DB" ]; then
+    : >"$DB"
+fi
+
+
 chmod 600 "$DB"
 
+
+# ============================================================
+# Configuration
+# ============================================================
+
+FLOWTABLE="auto"
+
+IFACES=""
+
+
+if [ -r "$CONFIG" ]; then
+
+    . "$CONFIG"
+
+fi
+
+
+# ============================================================
+# Lock
+# ============================================================
+
 exec 9>/run/nftctl.lock
+
 flock -x 9
 
+
+# ============================================================
+# Validation
+# ============================================================
+
 valid_ip() {
+
     local ip="$1"
 
-    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
-
     local a b c d n
-    IFS='.' read -r a b c d <<< "$ip"
 
-    for n in "$a" "$b" "$c" "$d"; do
-        [[ "$n" =~ ^[0-9]+$ ]] || return 1
-        ((10#$n >= 0 && 10#$n <= 255)) || return 1
+
+    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] ||
+        return 1
+
+
+    IFS='.' read -r a b c d <<<"$ip"
+
+
+    for n in \
+        "$a" \
+        "$b" \
+        "$c" \
+        "$d"
+    do
+
+        [[ "$n" =~ ^[0-9]+$ ]] ||
+            return 1
+
+
+        ((10#$n >= 0 && 10#$n <= 255)) ||
+            return 1
+
     done
 
-    [ "$ip" != "0.0.0.0" ]
+
+    [ "$ip" != "0.0.0.0" ] &&
+    [ "$ip" != "255.255.255.255" ]
+
 }
+
 
 valid_port() {
-    [[ "$1" =~ ^[0-9]+$ ]] || return 1
+
+    [[ "${1:-}" =~ ^[0-9]+$ ]] ||
+        return 1
+
+
     ((10#$1 >= 1 && 10#$1 <= 65535))
+
 }
+
+
+# ============================================================
+# Database validation
+# ============================================================
+
+validate_db() {
+
+    local listen_port
+
+    local ip
+
+    local target_port
+
+    local extra
+
+    local seen=""
+
+
+    while read \
+        -r \
+        listen_port \
+        ip \
+        target_port \
+        extra
+    do
+
+        [ -n "${listen_port:-}" ] ||
+            continue
+
+
+        if [ -z "${target_port:-}" ]; then
+
+            target_port="$listen_port"
+
+        fi
+
+
+        if ! valid_port "$listen_port" ||
+           ! valid_ip "${ip:-}" ||
+           ! valid_port "$target_port" ||
+           [ -n "${extra:-}" ]
+        then
+
+            echo \
+"Invalid database row: $listen_port ${ip:-} ${target_port:-} ${extra:-}" \
+                >&2
+
+            return 1
+
+        fi
+
+
+        if grep \
+            -qx \
+            "$listen_port" \
+            <<<"$seen"
+        then
+
+            echo \
+"Duplicate listen port: $listen_port" \
+                >&2
+
+            return 1
+
+        fi
+
+
+        seen+="${listen_port}"$'\n'
+
+
+    done <"$DB"
+
+}
+
+
+# ============================================================
+# Detect other forward hooks
+# ============================================================
+
+foreign_forward_hook_exists() {
+
+    local fam
+
+    local name
+
+
+    while read \
+        -r \
+        _ \
+        fam \
+        name
+    do
+
+        [ -n "${fam:-}" ] ||
+            continue
+
+
+        [ -n "${name:-}" ] ||
+            continue
+
+
+        if [ "$fam" = "ip" ] &&
+           [ "$name" = "$TABLE" ]
+        then
+
+            continue
+
+        fi
+
+
+        if "$NFT" \
+            list table \
+            "$fam" \
+            "$name" \
+            2>/dev/null |
+            grep -Eq \
+            'hook[[:space:]]+forward'
+        then
+
+            return 0
+
+        fi
+
+
+    done < <(
+        "$NFT" \
+            list tables \
+            2>/dev/null ||
+        true
+    )
+
+
+    return 1
+
+}
+
+
+# ============================================================
+# Interface discovery
+# ============================================================
+
+collect_ifaces() {
+
+    local tmp
+
+    local dev
+
+    local ip
+
+
+    tmp="$(mktemp)"
+
+
+    if [ -n "${IFACES// }" ]; then
+
+        tr \
+            ', ' \
+            '\n\n' \
+            <<<"$IFACES" |
+            sed \
+                '/^$/d' \
+                >>"$tmp"
+
+    else
+
+        ip \
+            -o \
+            -4 \
+            addr show \
+            scope global \
+            2>/dev/null |
+            awk \
+                '{print $2}' \
+                >>"$tmp" ||
+            true
+
+
+        ip \
+            -o \
+            -4 \
+            route show \
+            default \
+            2>/dev/null |
+            awk '
+            {
+                for (i=1;i<=NF;i++) {
+
+                    if ($i=="dev")
+                        print $(i+1)
+
+                }
+            }
+            ' >>"$tmp" ||
+            true
+
+
+        while read \
+            -r \
+            _ \
+            ip \
+            _
+        do
+
+            [ -n "${ip:-}" ] ||
+                continue
+
+
+            ip \
+                route get \
+                "$ip" \
+                2>/dev/null |
+                awk '
+                {
+                    for (i=1;i<=NF;i++) {
+
+                        if ($i=="dev") {
+
+                            print $(i+1)
+
+                            exit
+
+                        }
+
+                    }
+                }
+                ' >>"$tmp" ||
+                true
+
+
+        done <"$DB"
+
+    fi
+
+
+    while read \
+        -r \
+        dev
+    do
+
+        [ -n "$dev" ] ||
+            continue
+
+
+        [ "$dev" != "lo" ] ||
+            continue
+
+
+        [[ "$dev" =~ ^[A-Za-z0-9_.:-]+$ ]] ||
+            continue
+
+
+        [ -d "/sys/class/net/$dev" ] ||
+            continue
+
+
+        echo "$dev"
+
+
+    done < <(
+        sort \
+            -u \
+            "$tmp"
+    )
+
+
+    rm -f "$tmp"
+
+}
+
+
+# ============================================================
+# Build nftables rules
+# ============================================================
+
+build_rules() {
+
+    local outfile="$1"
+
+    local use_flow="$2"
+
+    local ports=""
+
+    local targets=""
+
+    local first=1
+
+    local listen_port
+
+    local ip
+
+    local target_port
+
+    local dev
+
+    local devices=""
+
+    local first_dev=1
+
+
+    while read \
+        -r \
+        listen_port \
+        ip \
+        target_port
+    do
+
+        [ -n "${listen_port:-}" ] ||
+            continue
+
+
+        if [ -z "${target_port:-}" ]; then
+
+            target_port="$listen_port"
+
+        fi
+
+
+        if [ "$first" -eq 0 ]; then
+
+            ports+=", "
+
+            targets+=", "
+
+        fi
+
+
+        ports+="$listen_port"
+
+
+        targets+="$listen_port : $ip . $target_port"
+
+
+        first=0
+
+
+    done <"$DB"
+
+
+    {
+
+        # ----------------------------------------------------
+        # Atomic replacement
+        # ----------------------------------------------------
+
+        if "$NFT" \
+            list table \
+            ip \
+            "$TABLE" \
+            >/dev/null 2>&1
+        then
+
+            echo \
+"delete table ip $TABLE"
+
+        fi
+
+
+        echo \
+"table ip $TABLE {"
+
+
+        echo
+
+
+        # ----------------------------------------------------
+        # Listen ports
+        # ----------------------------------------------------
+
+        echo \
+"    set forward_ports {"
+
+
+        echo \
+"        type inet_service"
+
+
+        if [ -n "$ports" ]; then
+
+            echo \
+"        elements = { $ports }"
+
+        fi
+
+
+        echo \
+"    }"
+
+
+        echo
+
+
+        # ----------------------------------------------------
+        # Port -> IP + target port
+        # ----------------------------------------------------
+
+        echo \
+"    map targets {"
+
+
+        echo \
+"        type inet_service : ipv4_addr . inet_service"
+
+
+        if [ -n "$targets" ]; then
+
+            echo \
+"        elements = { $targets }"
+
+        fi
+
+
+        echo \
+"    }"
+
+
+        echo
+
+
+        # ----------------------------------------------------
+        # Flowtable
+        # ----------------------------------------------------
+
+        if [ "$use_flow" = "1" ]; then
+
+
+            while read \
+                -r \
+                dev
+            do
+
+                [ -n "$dev" ] ||
+                    continue
+
+
+                if [ "$first_dev" -eq 0 ]; then
+
+                    devices+=", "
+
+                fi
+
+
+                devices+="\"$dev\""
+
+
+                first_dev=0
+
+
+            done < <(
+                collect_ifaces
+            )
+
+
+            if [ -n "$devices" ]; then
+
+                echo \
+"    flowtable fastpath {"
+
+
+                echo \
+"        hook ingress priority 0"
+
+
+                echo \
+"        devices = { $devices }"
+
+
+                echo \
+"    }"
+
+
+                echo
+
+            else
+
+                use_flow=0
+
+            fi
+
+        fi
+
+
+        # ----------------------------------------------------
+        # DNAT
+        # ----------------------------------------------------
+
+        echo \
+"    chain prerouting {"
+
+
+        echo \
+"        type nat hook prerouting priority dstnat; policy accept;"
+
+
+        if [ -n "$ports" ]; then
+
+            echo \
+"        ip protocol tcp tcp dport @forward_ports ct mark set $MARK dnat ip addr . port to tcp dport map @targets"
+
+
+            echo \
+"        ip protocol udp udp dport @forward_ports ct mark set $MARK dnat ip addr . port to udp dport map @targets"
+
+        fi
+
+
+        echo \
+"    }"
+
+
+        echo
+
+
+        # ----------------------------------------------------
+        # Flowtable enrollment
+        # ----------------------------------------------------
+
+        if [ "$use_flow" = "1" ]; then
+
+            echo \
+"    chain forward {"
+
+
+            echo \
+"        type filter hook forward priority filter; policy accept;"
+
+
+            echo \
+"        ct mark $MARK ip protocol { tcp, udp } flow add @fastpath"
+
+
+            echo \
+"    }"
+
+
+            echo
+
+        fi
+
+
+        # ----------------------------------------------------
+        # Source NAT
+        # ----------------------------------------------------
+
+        echo \
+"    chain postrouting {"
+
+
+        echo \
+"        type nat hook postrouting priority srcnat; policy accept;"
+
+
+        echo \
+"        ct mark $MARK ct status dnat masquerade"
+
+
+        echo \
+"    }"
+
+
+        echo \
+"}"
+
+
+    } >"$outfile"
+
+}
+
+
+# ============================================================
+# Reload
+# ============================================================
 
 reload_rules() {
+
     local tmp
+
+    local use_flow=0
+
+    local wanted_flow="$FLOWTABLE"
+
+
+    validate_db
+
+
     tmp="$(mktemp)"
 
-    cat >"$tmp" <<'NFT'
-table ip nftctl {
-    chain prerouting {
-        type nat hook prerouting priority dstnat; policy accept;
-NFT
 
-    while read -r PORT IP; do
-        [ -n "$PORT" ] || continue
-        [ -n "$IP" ] || continue
+    case "$wanted_flow" in
 
-        printf '        tcp dport %s counter dnat to %s:%s\n' \
-            "$PORT" "$IP" "$PORT" >>"$tmp"
+        on|yes|1)
 
-        printf '        udp dport %s counter dnat to %s:%s\n' \
-            "$PORT" "$IP" "$PORT" >>"$tmp"
+            use_flow=1
 
-    done <"$DB"
+            ;;
 
-    cat >>"$tmp" <<'NFT'
-    }
 
-    chain postrouting {
-        type nat hook postrouting priority srcnat; policy accept;
-        ct status dnat counter masquerade
-    }
-}
-NFT
+        off|no|0)
 
-    "$NFT" delete table ip "$TABLE" >/dev/null 2>&1 || true
+            use_flow=0
 
-    if ! "$NFT" -f "$tmp"; then
-        echo "ERROR"
-        rm -f "$tmp"
-        exit 1
+            ;;
+
+
+        auto|"")
+
+            if foreign_forward_hook_exists
+            then
+
+                use_flow=0
+
+            else
+
+                use_flow=1
+
+            fi
+
+            ;;
+
+
+        *)
+
+            echo \
+"Invalid FLOWTABLE value in $CONFIG: $wanted_flow" \
+                >&2
+
+
+            rm -f "$tmp"
+
+
+            return 1
+
+            ;;
+
+    esac
+
+
+    build_rules \
+        "$tmp" \
+        "$use_flow"
+
+
+    # ========================================================
+    # Validate before applying
+    # ========================================================
+
+    if ! "$NFT" \
+        -c \
+        -f \
+        "$tmp" \
+        >/dev/null 2>&1
+    then
+
+
+        # ----------------------------------------------------
+        # Automatic flowtable fallback
+        # ----------------------------------------------------
+
+        if [ "$use_flow" = "1" ] &&
+           [ "$wanted_flow" = "auto" ]
+        then
+
+            build_rules \
+                "$tmp" \
+                0
+
+
+            if ! "$NFT" \
+                -c \
+                -f \
+                "$tmp" \
+                >/dev/null 2>&1
+            then
+
+                echo \
+"Ruleset validation failed." \
+                    >&2
+
+
+                "$NFT" \
+                    -c \
+                    -f \
+                    "$tmp"
+
+
+                rm -f "$tmp"
+
+
+                return 1
+
+            fi
+
+
+        else
+
+            echo \
+"Ruleset validation failed." \
+                >&2
+
+
+            "$NFT" \
+                -c \
+                -f \
+                "$tmp"
+
+
+            rm -f "$tmp"
+
+
+            return 1
+
+        fi
+
     fi
 
-    install -m 600 "$tmp" /etc/nftctl/rules.nft
+
+    # ========================================================
+    # Apply
+    # ========================================================
+
+    "$NFT" \
+        -f \
+        "$tmp"
+
+
+    install \
+        -m 600 \
+        "$tmp" \
+        "$RULES"
+
+
     rm -f "$tmp"
+
+
+    if "$NFT" \
+        list flowtable \
+        ip \
+        "$TABLE" \
+        fastpath \
+        >/dev/null 2>&1
+    then
+
+        echo \
+"Reloaded. Fast path: on"
+
+    else
+
+        echo \
+"Reloaded. Fast path: off"
+
+    fi
+
 }
+
+
+# ============================================================
+# Add rule
+# ============================================================
 
 add_rule() {
-    local IP PORT tmp
 
-    echo
-    read -rp "IP: " IP
+    local ip="${1:-}"
 
-    if ! valid_ip "$IP"; then
-        echo "Invalid IP."
-        exit 1
-    fi
+    local listen_port="${2:-}"
 
-    read -rp "Port: " PORT
+    local target_port="${3:-}"
 
-    if ! valid_port "$PORT"; then
-        echo "Invalid port."
-        exit 1
-    fi
-
-    tmp="$(mktemp)"
-
-    awk -v p="$PORT" '$1 != p {print}' "$DB" >"$tmp"
-
-    printf '%s %s\n' "$PORT" "$IP" >>"$tmp"
-
-    sort -n -k1,1 "$tmp" >"${tmp}.sorted"
-
-    install -m 600 "${tmp}.sorted" "$DB"
-
-    rm -f "$tmp" "${tmp}.sorted"
-
-    reload_rules
-
-    echo
-    echo "OK"
-    echo "$PORT -> $IP:$PORT"
-    echo "TCP + UDP"
-    echo
-}
-
-list_rules() {
-    echo
-
-    if [ ! -s "$DB" ]; then
-        echo "Empty."
-        echo
-        exit 0
-    fi
-
-    printf "%-10s %-18s %-10s\n" "PORT" "IP" "PROTO"
-    printf "%-10s %-18s %-10s\n" "-----" "---------------" "-------"
-
-    while read -r PORT IP; do
-        [ -n "$PORT" ] || continue
-        printf "%-10s %-18s %-10s\n" "$PORT" "$IP" "TCP+UDP"
-    done <"$DB"
-
-    echo
-}
-
-delete_rule() {
-    local PORT="${1:-}"
     local tmp
 
-    if [ -z "$PORT" ]; then
-        read -rp "Port: " PORT
+
+    # --------------------------------------------------------
+    # Target IP
+    # --------------------------------------------------------
+
+    if [ -z "$ip" ]; then
+
+        read \
+            -rp \
+            "Target IP: " \
+            ip
+
     fi
 
-    if ! valid_port "$PORT"; then
-        echo "Invalid port."
-        exit 1
+
+    if ! valid_ip "$ip"; then
+
+        echo \
+"Invalid IP."
+
+
+        return 1
+
     fi
 
-    if ! awk -v p="$PORT" '$1 == p {x=1} END {exit !x}' "$DB"; then
-        echo "Not found."
-        exit 1
+
+    # --------------------------------------------------------
+    # Listen port
+    # --------------------------------------------------------
+
+    if [ -z "$listen_port" ]; then
+
+        read \
+            -rp \
+            "Listen port: " \
+            listen_port
+
     fi
+
+
+    if ! valid_port "$listen_port"; then
+
+        echo \
+"Invalid listen port."
+
+
+        return 1
+
+    fi
+
+
+    # --------------------------------------------------------
+    # Target port
+    # --------------------------------------------------------
+
+    if [ -z "$target_port" ]; then
+
+        read \
+            -rp \
+            "Target port [$listen_port]: " \
+            target_port
+
+
+        if [ -z "$target_port" ]; then
+
+            target_port="$listen_port"
+
+        fi
+
+    fi
+
+
+    if ! valid_port "$target_port"; then
+
+        echo \
+"Invalid target port."
+
+
+        return 1
+
+    fi
+
+
+    # --------------------------------------------------------
+    # Update database
+    # --------------------------------------------------------
 
     tmp="$(mktemp)"
 
-    awk -v p="$PORT" '$1 != p {print}' "$DB" >"$tmp"
 
-    install -m 600 "$tmp" "$DB"
+    awk \
+        -v p="$listen_port" \
+        '$1 != p {print}' \
+        "$DB" \
+        >"$tmp"
+
+
+    printf \
+        '%s %s %s\n' \
+        "$listen_port" \
+        "$ip" \
+        "$target_port" \
+        >>"$tmp"
+
+
+    sort \
+        -n \
+        -k1,1 \
+        "$tmp" \
+        -o "$tmp"
+
+
+    install \
+        -m 600 \
+        "$tmp" \
+        "$DB"
+
 
     rm -f "$tmp"
 
+
     reload_rules
 
+
     echo
-    echo "OK"
-    echo "Removed: $PORT"
+
+    echo \
+"$listen_port -> $ip:$target_port"
+
+
+    echo \
+"TCP + UDP"
+
+
     echo
+
 }
 
+
+# ============================================================
+# List rules
+# ============================================================
+
+list_rules() {
+
+    local listen_port
+
+    local ip
+
+    local target_port
+
+
+    echo
+
+
+    if [ ! -s "$DB" ]; then
+
+        echo \
+"Empty."
+
+
+        echo
+
+
+        return 0
+
+    fi
+
+
+    printf \
+        '%-12s %-18s %-12s %-10s\n' \
+        "LISTEN" \
+        "TARGET IP" \
+        "TARGET PORT" \
+        "PROTO"
+
+
+    printf \
+        '%-12s %-18s %-12s %-10s\n' \
+        "------" \
+        "---------------" \
+        "-----------" \
+        "-------"
+
+
+    while read \
+        -r \
+        listen_port \
+        ip \
+        target_port
+    do
+
+        [ -n "${listen_port:-}" ] ||
+            continue
+
+
+        if [ -z "${target_port:-}" ]; then
+
+            target_port="$listen_port"
+
+        fi
+
+
+        printf \
+            '%-12s %-18s %-12s %-10s\n' \
+            "$listen_port" \
+            "$ip" \
+            "$target_port" \
+            "TCP+UDP"
+
+
+    done <"$DB"
+
+
+    echo
+
+}
+
+
+# ============================================================
+# Delete rule
+# ============================================================
+
+delete_rule() {
+
+    local port="${1:-}"
+
+    local tmp
+
+
+    if [ -z "$port" ]; then
+
+        read \
+            -rp \
+            "Listen port: " \
+            port
+
+    fi
+
+
+    if ! valid_port "$port"; then
+
+        echo \
+"Invalid port."
+
+
+        return 1
+
+    fi
+
+
+    if ! awk \
+        -v p="$port" \
+        '$1 == p {found=1} END {exit !found}' \
+        "$DB"
+    then
+
+        echo \
+"Not found."
+
+
+        return 1
+
+    fi
+
+
+    tmp="$(mktemp)"
+
+
+    awk \
+        -v p="$port" \
+        '$1 != p {print}' \
+        "$DB" \
+        >"$tmp"
+
+
+    install \
+        -m 600 \
+        "$tmp" \
+        "$DB"
+
+
+    rm -f "$tmp"
+
+
+    reload_rules
+
+
+    echo
+
+    echo \
+"Removed: $port"
+
+    echo
+
+}
+
+
+# ============================================================
+# Status
+# ============================================================
+
+status_cmd() {
+
+    local count
+
+    local max
+
+    local flow="off"
+
+    local interfaces
+
+
+    if "$NFT" \
+        list flowtable \
+        ip \
+        "$TABLE" \
+        fastpath \
+        >/dev/null 2>&1
+    then
+
+        flow="on"
+
+    fi
+
+
+    count=$(
+        cat \
+            /proc/sys/net/netfilter/nf_conntrack_count \
+            2>/dev/null ||
+        echo n/a
+    )
+
+
+    max=$(
+        cat \
+            /proc/sys/net/netfilter/nf_conntrack_max \
+            2>/dev/null ||
+        echo n/a
+    )
+
+
+    interfaces=$(
+        collect_ifaces |
+        paste \
+            -sd, \
+            -
+    )
+
+
+    echo
+
+    echo \
+"nftctl"
+
+    echo
+
+
+    printf \
+        '%-16s %s\n' \
+        "Rules:" \
+        "$(
+            awk \
+                'NF>=2 {n++} END {print n+0}' \
+                "$DB"
+        )"
+
+
+    printf \
+        '%-16s %s\n' \
+        "Fast path:" \
+        "$flow"
+
+
+    printf \
+        '%-16s %s\n' \
+        "IPv4 forward:" \
+        "$(
+            sysctl \
+                -n \
+                net.ipv4.ip_forward \
+                2>/dev/null ||
+            echo n/a
+        )"
+
+
+    printf \
+        '%-16s %s\n' \
+        "Conntrack:" \
+        "$count / $max"
+
+
+    printf \
+        '%-16s %s\n' \
+        "Qdisc:" \
+        "$(
+            sysctl \
+                -n \
+                net.core.default_qdisc \
+                2>/dev/null ||
+            echo n/a
+        )"
+
+
+    printf \
+        '%-16s %s\n' \
+        "TCP CC:" \
+        "$(
+            sysctl \
+                -n \
+                net.ipv4.tcp_congestion_control \
+                2>/dev/null ||
+            echo n/a
+        )"
+
+
+    printf \
+        '%-16s %s\n' \
+        "Interfaces:" \
+        "$interfaces"
+
+
+    echo
+
+}
+
+
+# ============================================================
+# Diagnostics
+# ============================================================
+
+diag_cmd() {
+
+    local dev
+
+
+    echo
+
+    echo \
+"========================================"
+
+    echo \
+"SYSTEM"
+
+    echo \
+"========================================"
+
+
+    uname \
+        -srmo
+
+
+    echo \
+"CPU: $(nproc 2>/dev/null || echo n/a)"
+
+
+    awk '
+    /MemTotal:/ {
+        printf "RAM: %.0f MiB\n", $2/1024
+    }
+    ' /proc/meminfo
+
+
+    echo
+
+
+    echo \
+"========================================"
+
+    echo \
+"ROUTE"
+
+    echo \
+"========================================"
+
+
+    ip \
+        -4 \
+        route show
+
+
+    echo
+
+
+    echo \
+"========================================"
+
+    echo \
+"INTERFACES"
+
+    echo \
+"========================================"
+
+
+    ip \
+        -br \
+        -4 \
+        addr show \
+        2>/dev/null ||
+        true
+
+
+    echo
+
+
+    for dev in $(
+        collect_ifaces
+    )
+    do
+
+        echo
+
+        echo \
+"----------------------------------------"
+
+        echo \
+"$dev"
+
+        echo \
+"----------------------------------------"
+
+
+        ethtool \
+            -l \
+            "$dev" \
+            2>/dev/null ||
+            true
+
+
+        echo
+
+
+        ethtool \
+            -k \
+            "$dev" \
+            2>/dev/null |
+            grep \
+                -E \
+'^(rx-checksumming|tx-checksumming|tcp-segmentation-offload|generic-segmentation-offload|generic-receive-offload|large-receive-offload|rx-gro-hw|hw-tc-offload):' ||
+            true
+
+
+        echo
+
+
+        tc \
+            -s \
+            qdisc show \
+            dev \
+            "$dev" \
+            2>/dev/null ||
+            true
+
+    done
+
+
+    echo
+
+
+    echo \
+"========================================"
+
+    echo \
+"CONNTRACK"
+
+    echo \
+"========================================"
+
+
+    printf \
+"count: "
+
+
+    cat \
+        /proc/sys/net/netfilter/nf_conntrack_count \
+        2>/dev/null ||
+        echo n/a
+
+
+    printf \
+"max:   "
+
+
+    cat \
+        /proc/sys/net/netfilter/nf_conntrack_max \
+        2>/dev/null ||
+        echo n/a
+
+
+    echo
+
+
+    conntrack \
+        -S \
+        2>/dev/null ||
+        true
+
+
+    echo
+
+
+    echo \
+"========================================"
+
+    echo \
+"SOCKETS"
+
+    echo \
+"========================================"
+
+
+    ss \
+        -s \
+        2>/dev/null ||
+        true
+
+
+    echo
+
+
+    echo \
+"========================================"
+
+    echo \
+"NFTCTL"
+
+    echo \
+"========================================"
+
+
+    "$NFT" \
+        list table \
+        ip \
+        "$TABLE" \
+        2>/dev/null ||
+        true
+
+
+    echo
+
+}
+
+
+# ============================================================
+# Self test
+# ============================================================
+
+selftest_cmd() {
+
+    local failed=0
+
+    local listen_port
+
+    local ip
+
+    local target_port
+
+
+    echo
+
+    echo \
+"Database:"
+
+
+    if validate_db
+    then
+
+        echo \
+"  OK"
+
+    else
+
+        echo \
+"  FAIL"
+
+
+        failed=1
+
+    fi
+
+
+    echo
+
+    echo \
+"IPv4 forwarding:"
+
+
+    if [ "$(
+        sysctl \
+            -n \
+            net.ipv4.ip_forward \
+            2>/dev/null ||
+        echo 0
+    )" = "1" ]
+    then
+
+        echo \
+"  OK"
+
+    else
+
+        echo \
+"  FAIL"
+
+
+        failed=1
+
+    fi
+
+
+    echo
+
+    echo \
+"nftables table:"
+
+
+    if "$NFT" \
+        list table \
+        ip \
+        "$TABLE" \
+        >/dev/null 2>&1
+    then
+
+        echo \
+"  OK"
+
+    else
+
+        echo \
+"  FAIL"
+
+
+        failed=1
+
+    fi
+
+
+    echo
+
+    echo \
+"Routes:"
+
+
+    if [ ! -s "$DB" ]; then
+
+        echo \
+"  Empty"
+
+    fi
+
+
+    while read \
+        -r \
+        listen_port \
+        ip \
+        target_port
+    do
+
+        [ -n "${listen_port:-}" ] ||
+            continue
+
+
+        if [ -z "${target_port:-}" ]; then
+
+            target_port="$listen_port"
+
+        fi
+
+
+        if ip \
+            route get \
+            "$ip" \
+            >/dev/null 2>&1
+        then
+
+            echo \
+"  $listen_port -> $ip:$target_port: OK"
+
+        else
+
+            echo \
+"  $listen_port -> $ip:$target_port: FAIL"
+
+
+            failed=1
+
+        fi
+
+
+    done <"$DB"
+
+
+    echo
+
+    echo \
+"Saved ruleset:"
+
+
+    if [ -s "$RULES" ] &&
+       "$NFT" \
+        -c \
+        -f \
+        "$RULES" \
+        >/dev/null 2>&1
+    then
+
+        echo \
+"  OK"
+
+    else
+
+        echo \
+"  FAIL"
+
+
+        failed=1
+
+    fi
+
+
+    echo
+
+
+    if [ "$failed" -eq 0 ]; then
+
+        echo \
+"Result: OK"
+
+    else
+
+        echo \
+"Result: FAIL"
+
+
+        return 1
+
+    fi
+
+
+    echo
+
+}
+
+
+# ============================================================
+# Usage
+# ============================================================
+
+usage() {
+
+    cat <<'USAGE'
+
+Usage:
+
+  nftctl add
+
+  nftctl add TARGET_IP LISTEN_PORT
+
+  nftctl add TARGET_IP LISTEN_PORT TARGET_PORT
+
+  nftctl list
+
+  nftctl del LISTEN_PORT
+
+  nftctl reload
+
+  nftctl status
+
+  nftctl diag
+
+  nftctl selftest
+
+
+Examples:
+
+  nftctl add 203.0.113.10 443
+
+      443 -> 203.0.113.10:443
+
+
+  nftctl add 203.0.113.10 5555 443
+
+      5555 -> 203.0.113.10:443
+
+USAGE
+
+}
+
+
+# ============================================================
+# Main
+# ============================================================
+
 case "${1:-add}" in
+
     add)
-        add_rule
+
+        shift ||
+            true
+
+
+        add_rule \
+            "${1:-}" \
+            "${2:-}" \
+            "${3:-}"
+
         ;;
+
+
     list)
+
         list_rules
+
         ;;
-    del)
-        delete_rule "${2:-}"
+
+
+    del|delete|rm)
+
+        shift ||
+            true
+
+
+        delete_rule \
+            "${1:-}"
+
         ;;
+
+
     reload)
+
         reload_rules
+
         ;;
+
+
+    status)
+
+        status_cmd
+
+        ;;
+
+
+    diag)
+
+        diag_cmd
+
+        ;;
+
+
+    selftest)
+
+        selftest_cmd
+
+        ;;
+
+
+    help|-h|--help)
+
+        usage
+
+        ;;
+
+
     *)
-        echo "nft"
-        echo "nftctl list"
-        echo "nftctl del PORT"
-        echo "nftctl reload"
+
+        usage
+
+
         exit 1
+
         ;;
+
 esac
 SCRIPT
 
-chmod 755 /usr/local/sbin/nftctl-core
 
+# ============================================================
+# Permissions
+# ============================================================
+
+chmod 755 \
+    /usr/local/sbin/nftctl-core
+
+
+# ============================================================
+# Frontend
+# ============================================================
 
 cat >/usr/local/bin/nftctl <<'SCRIPT'
 #!/bin/bash
 
+set -e
+
+
 if [ "$(id -u)" -eq 0 ]; then
-    exec /usr/local/sbin/nftctl-core "$@"
+
+    exec \
+        /usr/local/sbin/nftctl-core \
+        "$@"
+
 else
-    exec sudo /usr/local/sbin/nftctl-core "$@"
+
+    exec \
+        sudo \
+        /usr/local/sbin/nftctl-core \
+        "$@"
+
 fi
 SCRIPT
 
-chmod 755 /usr/local/bin/nftctl
+
+chmod 755 \
+    /usr/local/bin/nftctl
 
 
-cat >/usr/local/bin/nft <<'SCRIPT'
-#!/bin/bash
-
-REAL=""
-
-for x in /usr/sbin/nft /usr/bin/nft /sbin/nft /bin/nft; do
-    if [ -x "$x" ]; then
-        REAL="$x"
-        break
-    fi
-done
-
-if [ "$#" -eq 0 ]; then
-    if [ "$(id -u)" -eq 0 ]; then
-        exec /usr/local/sbin/nftctl-core add
-    else
-        exec sudo /usr/local/sbin/nftctl-core add
-    fi
-fi
-
-exec "$REAL" "$@"
-SCRIPT
-
-chmod 755 /usr/local/bin/nft
-
+# ============================================================
+# systemd
+# ============================================================
 
 cat >/etc/systemd/system/nftctl.service <<'SERVICE'
 [Unit]
-Description=nftctl
+Description=nftctl network forwarding rules
 After=network-online.target nftables.service
 Wants=network-online.target
 
@@ -321,31 +2336,139 @@ RemainAfterExit=yes
 WantedBy=multi-user.target
 SERVICE
 
-systemctl daemon-reload
-systemctl enable nftctl.service >/dev/null 2>&1
 
-/usr/local/sbin/nftctl-core reload
+systemctl \
+    daemon-reload
+
+
+systemctl \
+    enable \
+    nftctl.service \
+    >/dev/null 2>&1
+
+
+# ============================================================
+# Initial rules
+# ============================================================
+
+/usr/local/sbin/nftctl-core \
+    reload
+
+
+systemctl \
+    restart \
+    nftctl.service \
+    >/dev/null 2>&1 ||
+    true
+
+
+# ============================================================
+# Result
+# ============================================================
 
 echo
-echo "========================================"
-echo "OK"
-echo "========================================"
+
+echo \
+"========================================"
+
+echo \
+"nftctl installed"
+
+echo \
+"========================================"
+
 echo
-echo "Add:"
-echo "  nft"
+
+echo \
+"Interactive add:"
+
+echo \
+"  nftctl add"
+
 echo
-echo "List:"
-echo "  nftctl list"
+
+echo \
+"Same-port mapping:"
+
+echo \
+"  nftctl add 203.0.113.10 443"
+
 echo
-echo "Delete:"
-echo "  nftctl del 443"
+
+echo \
+"Custom target port:"
+
+echo \
+"  nftctl add 203.0.113.10 5555 443"
+
 echo
-echo "Reload:"
-echo "  nftctl reload"
+
+echo \
+"List:"
+
+echo \
+"  nftctl list"
+
 echo
-echo "Status:"
-sysctl net.ipv4.ip_forward 2>/dev/null || true
-sysctl net.ipv4.tcp_congestion_control 2>/dev/null || true
-sysctl net.core.default_qdisc 2>/dev/null || true
+
+echo \
+"Delete:"
+
+echo \
+"  nftctl del 443"
+
 echo
+
+echo \
+"Reload:"
+
+echo \
+"  nftctl reload"
+
+echo
+
+echo \
+"Status:"
+
+echo \
+"  nftctl status"
+
+echo
+
+echo \
+"Diagnostics:"
+
+echo \
+"  nftctl diag"
+
+echo
+
+echo \
+"Self test:"
+
+echo \
+"  nftctl selftest"
+
+echo
+
+echo \
+"Config:"
+
+echo \
+"  /etc/nftctl/config"
+
+echo
+
+echo \
+"Database:"
+
+echo \
+"  /etc/nftctl/db"
+
+echo
+
+
+/usr/local/sbin/nftctl-core \
+    status
+
 EOF
