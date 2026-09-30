@@ -44,21 +44,16 @@ for x in \
     /sbin/nft \
     /bin/nft
 do
-
     if [ -x "$x" ]; then
         NFT_BIN="$x"
         break
     fi
-
 done
 
 
 if [ -z "$NFT_BIN" ]; then
-
     echo "nft not found."
-
     exit 1
-
 fi
 
 
@@ -83,7 +78,7 @@ chmod 600 /etc/nftctl/db
 
 
 # ============================================================
-# Migrate old database
+# Database migration
 #
 # Old:
 # LISTEN_PORT TARGET_IP
@@ -128,7 +123,7 @@ fi
 # Configuration
 #
 # Preserve manually specified interfaces.
-# Flowtable returns to automatic mode.
+# Flowtable uses automatic mode.
 # ============================================================
 
 OLD_IFACES=""
@@ -160,7 +155,7 @@ chmod 600 /etc/nftctl/config
 
 
 # ============================================================
-# Remove wrapper from old version
+# Remove old nft wrapper
 # ============================================================
 
 if [ -f /usr/local/bin/nft ] && \
@@ -793,11 +788,18 @@ collect_ifaces() {
 # ============================================================
 # Automatic fast-path compatibility check
 #
+# NAT chains are allowed.
 # Empty ACCEPT chains are allowed.
 #
-# Fast path is automatically disabled when another
-# ingress/prerouting/forward/postrouting base chain contains
-# actual rules or a non-ACCEPT policy.
+# Non-NAT rules on:
+# ingress
+# prerouting
+# forward
+# postrouting
+#
+# are treated as conflicts.
+#
+# Non-ACCEPT policies on those hooks are also conflicts.
 # ============================================================
 
 foreign_path_conflict_exists() {
@@ -868,6 +870,8 @@ foreign_path_conflict_exists() {
 
                     hook: $c.hook,
 
+                    type: ($c.type // "-"),
+
                     policy: ($c.policy // "-"),
 
                     rules: ([
@@ -891,12 +895,16 @@ foreign_path_conflict_exists() {
                 }
 
                 | select(
-                    .rules > 0
-                    or
                     (
                         .policy != "-"
                         and
                         .policy != "accept"
+                    )
+                    or
+                    (
+                        .rules > 0
+                        and
+                        .type != "nat"
                     )
                 )
 
@@ -1002,6 +1010,8 @@ flow_conflict_report() {
 
                 hook: $c.hook,
 
+                type: ($c.type // "-"),
+
                 policy: ($c.policy // "-"),
 
                 rules: ([
@@ -1025,12 +1035,16 @@ flow_conflict_report() {
             }
 
             | select(
-                .rules > 0
-                or
                 (
                     .policy != "-"
                     and
                     .policy != "accept"
+                )
+                or
+                (
+                    .rules > 0
+                    and
+                    .type != "nat"
                 )
             )
 
@@ -1044,7 +1058,7 @@ flow_conflict_report() {
 
             .[]
 
-            | "\(.family) \(.table) \(.chain) hook=\(.hook) policy=\(.policy) rules=\(.rules)"
+            | "\(.family) \(.table) \(.chain) type=\(.type) hook=\(.hook) policy=\(.policy) rules=\(.rules)"
 
           end
         ' \
@@ -1175,7 +1189,7 @@ build_rules() {
 
 
         # ----------------------------------------------------
-        # Listen port -> target address and port
+        # Listen port -> target address + target port
         # ----------------------------------------------------
 
         echo \
@@ -1425,7 +1439,7 @@ reload_rules() {
 
 
     # ========================================================
-    # Validate
+    # Validate before applying
     # ========================================================
 
     if ! "$NFT" \
@@ -1552,10 +1566,6 @@ add_rule() {
     local tmp
 
 
-    # --------------------------------------------------------
-    # Target IP
-    # --------------------------------------------------------
-
     if [ -z "$ip" ]; then
 
         read \
@@ -1577,10 +1587,6 @@ add_rule() {
     fi
 
 
-    # --------------------------------------------------------
-    # Listen port
-    # --------------------------------------------------------
-
     if [ -z "$listen_port" ]; then
 
         read \
@@ -1601,10 +1607,6 @@ add_rule() {
 
     fi
 
-
-    # --------------------------------------------------------
-    # Target port
-    # --------------------------------------------------------
 
     if [ -z "$target_port" ]; then
 
@@ -1633,10 +1635,6 @@ add_rule() {
 
     fi
 
-
-    # --------------------------------------------------------
-    # Update database
-    # --------------------------------------------------------
 
     tmp="$(mktemp)"
 
@@ -1844,6 +1842,7 @@ delete_rule() {
     echo \
 "Removed: $port"
 
+
     echo
 
 }
@@ -2001,7 +2000,7 @@ status_cmd() {
 
 
 # ============================================================
-# Flowtable check
+# Flowtable compatibility check
 # ============================================================
 
 flowcheck_cmd() {
@@ -2015,6 +2014,40 @@ flowcheck_cmd() {
 
 
     flow_conflict_report
+
+
+    echo
+
+}
+
+
+# ============================================================
+# Show software-offloaded flows
+# ============================================================
+
+offload_cmd() {
+
+    echo
+
+    echo \
+"Software-offloaded conntrack entries:"
+
+
+    if conntrack \
+        -L \
+        2>/dev/null |
+        grep \
+            '\[OFFLOAD\]'
+    then
+
+        :
+
+    else
+
+        echo \
+"None currently visible."
+
+    fi
 
 
     echo
@@ -2165,6 +2198,28 @@ diag_cmd() {
 
 
     flow_conflict_report
+
+
+    echo
+
+
+    echo \
+"========================================"
+
+    echo \
+"OFFLOAD"
+
+    echo \
+"========================================"
+
+
+    conntrack \
+        -L \
+        2>/dev/null |
+        grep \
+            '\[OFFLOAD\]' ||
+        echo \
+"None currently visible."
 
 
     echo
@@ -2521,6 +2576,8 @@ Usage:
 
   nftctl flowcheck
 
+  nftctl offload
+
   nftctl diag
 
   nftctl selftest
@@ -2593,6 +2650,13 @@ case "${1:-add}" in
     flowcheck)
 
         flowcheck_cmd
+
+        ;;
+
+
+    offload)
+
+        offload_cmd
 
         ;;
 
@@ -2793,6 +2857,14 @@ echo \
 
 echo \
 "  nftctl flowcheck"
+
+echo
+
+echo \
+"Offloaded flows:"
+
+echo \
+"  nftctl offload"
 
 echo
 
