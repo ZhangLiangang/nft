@@ -28,7 +28,8 @@ apt-get install -y \
     util-linux \
     ethtool \
     conntrack \
-    irqbalance
+    irqbalance \
+    jq
 
 
 # ============================================================
@@ -43,15 +44,21 @@ for x in \
     /sbin/nft \
     /bin/nft
 do
+
     if [ -x "$x" ]; then
         NFT_BIN="$x"
         break
     fi
+
 done
 
+
 if [ -z "$NFT_BIN" ]; then
+
     echo "nft not found."
+
     exit 1
+
 fi
 
 
@@ -105,10 +112,12 @@ if [ -s /etc/nftctl/db ]; then
         }
     ' /etc/nftctl/db >"$DB_MIGRATE"
 
+
     install \
         -m 600 \
         "$DB_MIGRATE" \
         /etc/nftctl/db
+
 
     rm -f "$DB_MIGRATE"
 
@@ -117,30 +126,53 @@ fi
 
 # ============================================================
 # Configuration
+#
+# Preserve manually specified interfaces.
+# Flowtable returns to automatic mode.
 # ============================================================
 
-if [ ! -e /etc/nftctl/config ]; then
+OLD_IFACES=""
 
-    cat >/etc/nftctl/config <<'CONFIG'
-FLOWTABLE=auto
-IFACES=""
-CONFIG
+if [ -r /etc/nftctl/config ]; then
 
-    chmod 600 /etc/nftctl/config
+    FLOWTABLE="auto"
+
+    IFACES=""
+
+    . /etc/nftctl/config || true
+
+    OLD_IFACES="${IFACES:-}"
 
 fi
 
 
+{
+    echo 'FLOWTABLE=auto'
+
+    printf \
+        'IFACES=%q\n' \
+        "$OLD_IFACES"
+
+} >/etc/nftctl/config
+
+
+chmod 600 /etc/nftctl/config
+
+
 # ============================================================
-# Remove old nft wrapper
+# Remove wrapper from old version
 # ============================================================
 
 if [ -f /usr/local/bin/nft ] && \
-   grep -q '/usr/local/sbin/nftctl-core' \
+   grep \
+       -q \
+       '/usr/local/sbin/nftctl-core' \
        /usr/local/bin/nft \
        2>/dev/null
 then
+
     rm -f /usr/local/bin/nft
+
 fi
 
 
@@ -170,6 +202,7 @@ done
 
 : >/etc/modules-load.d/nftctl.conf
 
+
 for mod in \
     nf_conntrack \
     nf_nat \
@@ -179,11 +212,15 @@ for mod in \
     sch_fq
 do
 
-    if modprobe -n "$mod" \
+    if modprobe \
+        -n \
+        "$mod" \
         >/dev/null 2>&1
     then
+
         echo "$mod" \
             >>/etc/modules-load.d/nftctl.conf
+
     fi
 
 done
@@ -194,6 +231,7 @@ done
 # ============================================================
 
 SYSCTL_FILE="/etc/sysctl.d/99-nftctl.conf"
+
 
 cat >"$SYSCTL_FILE" <<'SYSCTL'
 net.ipv4.ip_forward = 1
@@ -339,12 +377,16 @@ if [ -e /proc/sys/net/netfilter/nf_conntrack_max ]; then
 
 
     if ! [[ "$CT_CURRENT" =~ ^[0-9]+$ ]]; then
+
         CT_CURRENT=0
+
     fi
 
 
     if [ "$CT_CURRENT" -gt "$CT_TARGET" ]; then
+
         CT_TARGET="$CT_CURRENT"
+
     fi
 
 
@@ -498,7 +540,13 @@ valid_ip() {
         return 1
 
 
-    IFS='.' read -r a b c d <<<"$ip"
+    IFS='.' read \
+        -r \
+        a \
+        b \
+        c \
+        d \
+        <<<"$ip"
 
 
     for n in \
@@ -605,68 +653,6 @@ validate_db() {
 
 
     done <"$DB"
-
-}
-
-
-# ============================================================
-# Detect other forward hooks
-# ============================================================
-
-foreign_forward_hook_exists() {
-
-    local fam
-
-    local name
-
-
-    while read \
-        -r \
-        _ \
-        fam \
-        name
-    do
-
-        [ -n "${fam:-}" ] ||
-            continue
-
-
-        [ -n "${name:-}" ] ||
-            continue
-
-
-        if [ "$fam" = "ip" ] &&
-           [ "$name" = "$TABLE" ]
-        then
-
-            continue
-
-        fi
-
-
-        if "$NFT" \
-            list table \
-            "$fam" \
-            "$name" \
-            2>/dev/null |
-            grep -Eq \
-            'hook[[:space:]]+forward'
-        then
-
-            return 0
-
-        fi
-
-
-    done < <(
-        "$NFT" \
-            list tables \
-            2>/dev/null ||
-        true
-    )
-
-
-    return 1
 
 }
 
@@ -805,7 +791,270 @@ collect_ifaces() {
 
 
 # ============================================================
-# Build nftables rules
+# Automatic fast-path compatibility check
+#
+# Empty ACCEPT chains are allowed.
+#
+# Fast path is automatically disabled when another
+# ingress/prerouting/forward/postrouting base chain contains
+# actual rules or a non-ACCEPT policy.
+# ============================================================
+
+foreign_path_conflict_exists() {
+
+    local json
+
+    local count
+
+
+    command -v jq \
+        >/dev/null 2>&1 ||
+        return 0
+
+
+    if ! json="$(
+        "$NFT" \
+            -j \
+            list ruleset \
+            2>/dev/null
+    )"
+    then
+
+        return 0
+
+    fi
+
+
+    if ! count="$(
+        jq \
+            -r \
+            --arg own "$TABLE" \
+            '
+            . as $root
+
+            | [
+
+                $root.nftables[]
+
+                | select(has("chain"))
+
+                | .chain
+
+                | select(
+                    .hook? == "ingress"
+                    or
+                    .hook? == "prerouting"
+                    or
+                    .hook? == "forward"
+                    or
+                    .hook? == "postrouting"
+                )
+
+                | select(
+                    .family != "ip"
+                    or
+                    .table != $own
+                )
+
+                | . as $c
+
+                | {
+
+                    family: $c.family,
+
+                    table: $c.table,
+
+                    chain: $c.name,
+
+                    hook: $c.hook,
+
+                    policy: ($c.policy // "-"),
+
+                    rules: ([
+
+                        $root.nftables[]
+
+                        | select(has("rule"))
+
+                        | .rule
+
+                        | select(
+                            .family == $c.family
+                            and
+                            .table == $c.table
+                            and
+                            .chain == $c.name
+                        )
+
+                    ] | length)
+
+                }
+
+                | select(
+                    .rules > 0
+                    or
+                    (
+                        .policy != "-"
+                        and
+                        .policy != "accept"
+                    )
+                )
+
+            ]
+
+            | length
+            ' \
+            <<<"$json" \
+            2>/dev/null
+    )"
+    then
+
+        return 0
+
+    fi
+
+
+    [[ "$count" =~ ^[0-9]+$ ]] ||
+        return 0
+
+
+    [ "$count" -gt 0 ]
+
+}
+
+
+# ============================================================
+# Fast-path compatibility report
+# ============================================================
+
+flow_conflict_report() {
+
+    local json
+
+
+    command -v jq \
+        >/dev/null 2>&1 ||
+        {
+
+            echo \
+"Conflict check unavailable: jq not found."
+
+            return 0
+
+        }
+
+
+    if ! json="$(
+        "$NFT" \
+            -j \
+            list ruleset \
+            2>/dev/null
+    )"
+    then
+
+        echo \
+"Conflict check unavailable: nft JSON output failed."
+
+        return 0
+
+    fi
+
+
+    jq \
+        -r \
+        --arg own "$TABLE" \
+        '
+        . as $root
+
+        | [
+
+            $root.nftables[]
+
+            | select(has("chain"))
+
+            | .chain
+
+            | select(
+                .hook? == "ingress"
+                or
+                .hook? == "prerouting"
+                or
+                .hook? == "forward"
+                or
+                .hook? == "postrouting"
+            )
+
+            | select(
+                .family != "ip"
+                or
+                .table != $own
+            )
+
+            | . as $c
+
+            | {
+
+                family: $c.family,
+
+                table: $c.table,
+
+                chain: $c.name,
+
+                hook: $c.hook,
+
+                policy: ($c.policy // "-"),
+
+                rules: ([
+
+                    $root.nftables[]
+
+                    | select(has("rule"))
+
+                    | .rule
+
+                    | select(
+                        .family == $c.family
+                        and
+                        .table == $c.table
+                        and
+                        .chain == $c.name
+                    )
+
+                ] | length)
+
+            }
+
+            | select(
+                .rules > 0
+                or
+                (
+                    .policy != "-"
+                    and
+                    .policy != "accept"
+                )
+            )
+
+        ]
+
+        | if length == 0 then
+
+            "No conflicting forwarding-path rules detected."
+
+          else
+
+            .[]
+
+            | "\(.family) \(.table) \(.chain) hook=\(.hook) policy=\(.policy) rules=\(.rules)"
+
+          end
+        ' \
+        <<<"$json"
+
+}
+
+
+# ============================================================
+# Build rules
 # ============================================================
 
 build_rules() {
@@ -875,7 +1124,7 @@ build_rules() {
     {
 
         # ----------------------------------------------------
-        # Atomic replacement
+        # Replace only nftctl table
         # ----------------------------------------------------
 
         if "$NFT" \
@@ -926,7 +1175,7 @@ build_rules() {
 
 
         # ----------------------------------------------------
-        # Port -> IP + target port
+        # Listen port -> target address and port
         # ----------------------------------------------------
 
         echo \
@@ -1139,7 +1388,7 @@ reload_rules() {
 
         auto|"")
 
-            if foreign_forward_hook_exists
+            if foreign_path_conflict_exists
             then
 
                 use_flow=0
@@ -1176,7 +1425,7 @@ reload_rules() {
 
 
     # ========================================================
-    # Validate before applying
+    # Validate
     # ========================================================
 
     if ! "$NFT" \
@@ -1188,7 +1437,7 @@ reload_rules() {
 
 
         # ----------------------------------------------------
-        # Automatic flowtable fallback
+        # Automatic fallback
         # ----------------------------------------------------
 
         if [ "$use_flow" = "1" ] &&
@@ -1614,6 +1863,8 @@ status_cmd() {
 
     local interfaces
 
+    local auto_check="clear"
+
 
     if "$NFT" \
         list flowtable \
@@ -1624,6 +1875,14 @@ status_cmd() {
     then
 
         flow="on"
+
+    fi
+
+
+    if foreign_path_conflict_exists
+    then
+
+        auto_check="conflict"
 
     fi
 
@@ -1668,6 +1927,18 @@ status_cmd() {
                 'NF>=2 {n++} END {print n+0}' \
                 "$DB"
         )"
+
+
+    printf \
+        '%-16s %s\n' \
+        "Flow mode:" \
+        "$FLOWTABLE"
+
+
+    printf \
+        '%-16s %s\n' \
+        "Auto check:" \
+        "$auto_check"
 
 
     printf \
@@ -1722,6 +1993,28 @@ status_cmd() {
         '%-16s %s\n' \
         "Interfaces:" \
         "$interfaces"
+
+
+    echo
+
+}
+
+
+# ============================================================
+# Flowtable check
+# ============================================================
+
+flowcheck_cmd() {
+
+    echo
+
+    echo \
+"Flowtable mode: $FLOWTABLE"
+
+    echo
+
+
+    flow_conflict_report
 
 
     echo
@@ -1865,6 +2158,22 @@ diag_cmd() {
 "========================================"
 
     echo \
+"FLOWTABLE CHECK"
+
+    echo \
+"========================================"
+
+
+    flow_conflict_report
+
+
+    echo
+
+
+    echo \
+"========================================"
+
+    echo \
 "CONNTRACK"
 
     echo \
@@ -1872,7 +2181,7 @@ diag_cmd() {
 
 
     printf \
-"count: "
+'count: '
 
 
     cat \
@@ -1882,7 +2191,7 @@ diag_cmd() {
 
 
     printf \
-"max:   "
+'max:   '
 
 
     cat \
@@ -2124,6 +2433,46 @@ selftest_cmd() {
 
     echo
 
+    echo \
+"Flowtable:"
+
+
+    if [ "$FLOWTABLE" = "off" ] ||
+       [ "$FLOWTABLE" = "no" ] ||
+       [ "$FLOWTABLE" = "0" ]
+    then
+
+        echo \
+"  Disabled by configuration"
+
+    elif "$NFT" \
+        list flowtable \
+        ip \
+        "$TABLE" \
+        fastpath \
+        >/dev/null 2>&1
+    then
+
+        echo \
+"  ON"
+
+    elif [ "$FLOWTABLE" = "auto" ] &&
+         foreign_path_conflict_exists
+    then
+
+        echo \
+"  OFF (automatic compatibility check)"
+
+    else
+
+        echo \
+"  OFF"
+
+    fi
+
+
+    echo
+
 
     if [ "$failed" -eq 0 ]; then
 
@@ -2170,6 +2519,8 @@ Usage:
 
   nftctl status
 
+  nftctl flowcheck
+
   nftctl diag
 
   nftctl selftest
@@ -2179,12 +2530,7 @@ Examples:
 
   nftctl add 203.0.113.10 443
 
-      443 -> 203.0.113.10:443
-
-
   nftctl add 203.0.113.10 5555 443
-
-      5555 -> 203.0.113.10:443
 
 USAGE
 
@@ -2240,6 +2586,13 @@ case "${1:-add}" in
     status)
 
         status_cmd
+
+        ;;
+
+
+    flowcheck)
+
+        flowcheck_cmd
 
         ;;
 
@@ -2348,7 +2701,7 @@ systemctl \
 
 
 # ============================================================
-# Initial rules
+# Initial load
 # ============================================================
 
 /usr/local/sbin/nftctl-core \
@@ -2432,6 +2785,14 @@ echo \
 
 echo \
 "  nftctl status"
+
+echo
+
+echo \
+"Flowtable check:"
+
+echo \
+"  nftctl flowcheck"
 
 echo
 
